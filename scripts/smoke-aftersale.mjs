@@ -148,6 +148,8 @@ const shipCountBeforeFail = s.shipments.length
 s.setRole('operator')
 assert(s.reviewAfterSale(apply4.id, true, '缺货挂起') === true, '库存不足：补发审核通过但转挂起（返回 true）')
 assert(apply4.status === 'waiting_stock' && !!apply4.shortageNote, '售后单 → 待补货（不动账，等待采购入库）')
+const firstReviewedAt = apply4.reviewedAt
+assert(!!firstReviewedAt && !apply4.fulfilledAt, '挂起时记录首次审核日、尚未履约（fulfilledAt 空）')
 assert(s.pendingOrWaitingAfterSaleCount >= 1 && s.waitingStockAfterSaleCount >= 1, '待补货单计入待处理售后队列/角标')
 assert(s.points === ptsBeforeFail && s.shipments.length === shipCountBeforeFail && g3().remain === 0,
   '挂起不落账：积分/发货单/库存均未变动')
@@ -171,6 +173,8 @@ assert(s.inboundPurchase(po.id, { qty: 999 }) === null, '累计验收不得超�
 // 库存已有余量即可从待处理售后继续履约（不必等采购入完）
 assert(s.reviewAfterSale(apply4.id, true, '首批到货，继续补发履约') === true, '首批入库后即可从待处理售后继续履约')
 assert(apply4.status === 'done' && g3().remain === 3, '继续履约落账：补发再扣 1 件（4→3）')
+assert(apply4.reviewedAt === firstReviewedAt && !!apply4.fulfilledAt,
+  '跨阶段续办分账：审核日保留首次审核日、履约日 fulfilledAt 已留痕')
 // 剩余批次入完，采购单转入库完成
 const b2 = s.inboundPurchase(po.id, { qty: 6, carrier: '测试供应商' })
 assert(!!b2 && g3().remain === 9, '剩余 6 件验收入库（3→9），累计入满 10 件')

@@ -35,18 +35,18 @@ export class InventoryService {
     }
     await this.k.commit([{ type: 'inv.mut', key: target.key, dRemain: 0, dFrozen: -qty }])
   }
-  // 直接扣减：remain -qty（正常落账）
-  async deduct(target, qty = 1) {
+  // 直接扣减：remain -qty（正常落账）；带 effectId 时崩溃重放/续办不重复扣减
+  async deduct(target, qty = 1, effectId = '') {
     this.requireAvailable(target, qty)
-    await this.k.commit([{ type: 'inv.mut', key: target.key, dRemain: -qty, dFrozen: 0 }])
+    await this.k.commit([{ type: 'inv.mut', key: target.key, dRemain: -qty, dFrozen: 0, effectId: effectId || undefined }])
   }
   // 释放预占并回补：remain +qty、frozen -qty（风控撤销）
   async releaseHeld(target, qty = 1) {
     await this.k.commit([{ type: 'inv.mut', key: target.key, dRemain: qty, dFrozen: -qty }])
   }
-  // 仅回补（售后拒收/退货）
-  async replenish(target, qty = 1) {
-    await this.k.commit([{ type: 'inv.mut', key: target.key, dRemain: qty, dFrozen: 0 }])
+  // 仅回补（售后拒收/退货）；带 effectId 时崩溃重放/续办不重复回补
+  async replenish(target, qty = 1, effectId = '') {
+    await this.k.commit([{ type: 'inv.mut', key: target.key, dRemain: qty, dFrozen: 0, effectId: effectId || undefined }])
   }
   // 采购验收入库：可用余量 +qty、账面总量 +qty（按验收批次实收，库存目标行需带 stock）
   async receive(target, qty = 1, effectId = '') {

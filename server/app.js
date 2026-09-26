@@ -30,7 +30,7 @@ export async function createApp(options = {}) {
   const inventory = new InventoryService(k)
   const coupons = new CouponService(k, audit)
   const budget = new BudgetService({ k, audit, locks })
-  const ship = new ShipService(k, audit, points, inventory, budget)
+  const ship = new ShipService(k, audit, points, inventory, budget, locks)
   const purchase = new PurchaseService(k, audit, inventory, locks, budget)
   const supplier = new SupplierService({ k, audit, locks, budget })
   const tasks = new TaskService(k, audit, points, budget)
@@ -51,14 +51,15 @@ export async function createApp(options = {}) {
     await seedPlatformSkeleton(k)
   }
 
-  // 启动续办：崩溃后重放 WAL，把 processing 的交易/审核单执行到终态（幂等无重复副作用）。
+  // 启动续办：崩溃后重放 WAL，把 processing 的交易/审核单/售后审核执行到终态（幂等无重复副作用）。
   // 可通过 options.autoResume=false 关闭（测试需先还原虚拟业务日再手工续办时使用）。
   if (options.autoResume !== false) {
     const resumedTrades = await trade.resumeAll({ name: '系统启动续办' })
     const resumedOrders = await risk.resumeProcessing()
-    if (resumedTrades.length || resumedOrders.length) {
+    const resumedAfterSales = await ship.resumeAfterSales({ name: '系统启动续办' })
+    if (resumedTrades.length || resumedOrders.length || resumedAfterSales.length) {
       await audit.log('saga-resume', '',
-        `启动续办完成：交易 ${resumedTrades.length} 笔、风控审核 ${resumedOrders.length} 笔已从断点续办到终态`,
+        `启动续办完成：交易 ${resumedTrades.length} 笔、风控审核 ${resumedOrders.length} 笔、售后审核 ${resumedAfterSales.length} 笔已从断点续办到终态`,
         { tenantId: '' })
     }
   }

@@ -229,6 +229,7 @@ async function route(app, req, res, json, ctx = {}) {
     const list = app.k.state.afterSales
       .filter((a) => (a.tenantId || 't-star') === tid())
       .filter((a) => !mine || a.userId === session.userId)
+      .map(({ processing, processingRunId, stages, ...rest }) => rest)
       .sort((a, b) => b.ts - a.ts)
     return json(res, 200, { afterSales: list })
   }
@@ -640,7 +641,8 @@ async function route(app, req, res, json, ctx = {}) {
     if (session.identityKind !== 'platform') throw new BizError('FORBIDDEN', '仅平台方可执行续办', 403)
     const trades = await app.trade.resumeAll(session)
     const orders = await app.risk.resumeProcessing()
-    return reply(res, 200, { ok: true, resumedTrades: trades, resumedOrders: orders })
+    const afterSales = await app.ship.resumeAfterSales(session)
+    return reply(res, 200, { ok: true, resumedTrades: trades, resumedOrders: orders, resumedAfterSales: afterSales })
   }
   if (method === 'POST' && p === '/api/admin/day') {
     if (session.identityKind !== 'platform') throw new BizError('FORBIDDEN', '仅平台方可切换业务日', 403)
@@ -683,6 +685,7 @@ function buildStateSnapshot(app, session) {
   const shipments = st.shipments.filter((o) => inT(o) && (!customer || o.userId === session.userId))
     .sort((a, b) => (b.ts || 0) - (a.ts || 0))
   const afterSales = st.afterSales.filter((a) => inT(a) && (!customer || a.userId === session.userId))
+    .map(({ processing, processingRunId, stages, ...rest }) => rest)
     .sort((a, b) => (b.ts || 0) - (a.ts || 0))
   const taskClaims = st.taskClaims.filter((c) => inT(c) && (!customer || c.userId === session.userId))
     .sort((a, b) => (b.ts || 0) - (a.ts || 0))

@@ -2210,7 +2210,8 @@ export const usePlatformStore = defineStore('platform', {
         refundPoints: refund,          // 审核通过时返还的积分快照（补发为 0）
         reshipmentId: '',              // 补发审核通过后生成的新发货单
         createdAt: this.todayDate, time: nowTime(), ts: Date.now(),
-        reviewedAt: '', reviewer: '', reviewNote: ''
+        reviewedAt: '', reviewer: '', reviewNote: '',
+        fulfilledAt: ''                // 履约实际处理日（待补货跨日续办时晚于首次审核日 reviewedAt）
       }
       this.afterSales.unshift(as)
       this.addAuditLog('aftersale-apply', as.id,
@@ -2374,7 +2375,9 @@ export const usePlatformStore = defineStore('platform', {
       }
 
       as.status = 'done'
-      as.reviewedAt = `${this.todayDate} ${nowTime()}`
+      // 审核日 reviewedAt 保留首次审核日（待补货挂起时已记）；履约日 fulfilledAt 按实际处理日记
+      if (!as.reviewedAt) as.reviewedAt = `${this.todayDate} ${nowTime()}`
+      as.fulfilledAt = `${this.todayDate} ${nowTime()}`
       as.reviewer = this.user.name
       as.reviewNote = remark
       this.addAuditLog('aftersale-approve', as.id,

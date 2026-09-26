@@ -1,6 +1,6 @@
 // 服务端履约链路冒烟测试（纯 node 运行，零依赖；不经过 HTTP，直接驱动服务装配）
 // 覆盖：多用户并发不超卖/余额正确、幂等重放、扣分预占+发奖幂等、
-//       交易/审核崩溃续办、跨日审核归属、P1–P6 对账与补偿幂等、租户 RBAC 越权拒绝留痕。
+//       交易/审核/售后审核崩溃续办、跨日审核归属（processDay 锚点）、P1–P6 对账与补偿幂等、租户 RBAC 越权拒绝留痕。
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import fs from 'node:fs'
@@ -218,6 +218,235 @@ async function testReleaseCrashAndCrossDay() {
   const d2 = app.recon.compute(day2, 't-star')
   assert(d2.points.expectedNet === 0 || !d2.points.detail.some((e) => Math.abs(e.delta) === 15),
     'day2 对账不含 day1 的任务奖励（跨日不串账）')
+  await app.k.close()
+}
+
+// 跨日续办统一锚点：风控撤销 Saga 在退款后崩溃、隔日续办——
+// 退款流水 bizDate=审核实际处理日(processDay)、date=实际落账日；reviewedAt 同锚 processDay，P1 三天均不串账。
+async function testRevokeCrashCrossDay() {
+  console.log('— 风控撤销 Saga 跨日续办：退款归属审核处理日，P1 不串账 —')
+  const db = tmpDb('revoke-cross')
+  let app = await createApp({ dbFile: db })
+  const day1 = '2026-09-20'
+  const day2 = '2026-09-21'
+  const day3 = '2026-09-22'
+  app.k.setBusinessDay(day1)
+  app.k.state.riskRules['t-star'] = {
+    ...app.k.state.riskRules['t-star'], enabled: true,
+    highValueRarities: ['legendary', 'epic'], dailyDrawThreshold: 0,
+    rapidDrawMax: 0, rapidDrawSeconds: 0, blacklist: []
+  }
+  const act = app.k.state.activities.find((a) => a.id === 'act-2')
+  await app.k.commit([{ type: 'upsert', table: 'activities', row: { ...act, dailyLimit: 10, totalLimit: 100, prizes: act.prizes.map((p) => ({ ...p, weight: p.id === 'p2' ? 100 : 0 })) } }])
+  const ctx = customerCtx(app)
+  const frozen = await app.trade.draw('act-2', ctx, { idempotencyKey: 'rv-cross' })
+  assert(frozen.trade.status === 'frozen' && frozen.trade.riskOrderId, 'day1 付费抽奖命中风控冻结（成本 10 积分预占）')
+  const orderId = frozen.trade.riskOrderId
+
+  // day2 撤销：退款落账后崩溃（revoke.afterRefund）
+  app.k.setBusinessDay(day2)
+  app.k.injectFault('revoke.afterRefund')
+  let crashed = null
+  try {
+    await app.risk.review(orderId, 'revoke', '跨日撤销（崩溃测试）', staffCtx(app, 'm-star-risk'))
+  } catch (e) { crashed = e }
+  assert(cashedOr(crashed), '撤销 Saga 在退款落账后中断（processing 锚点已落库）')
+  await app.k.close()
+
+  // day3 重启续办到终态
+  app = await createApp({ dbFile: db, autoResume: false })
+  app.k.setBusinessDay(day3)
+  const resumed = await app.risk.resumeProcessing()
+  assert(resumed.includes(orderId), '启动续办接管崩溃的撤销单')
+  const order = app.k.state.riskOrders.find((o) => o.id === orderId)
+  assert(order.status === 'revoked' && !order.processing, `续办完成：审核单 revoked（实际 ${order.status}）`)
+  assert(order.reviewedAt.startsWith(day2),
+    `审核时间归属实际处理日 day2（reviewedAt=${order.reviewedAt}，跨日续办不漂移）`)
+  const refundFlow = app.k.state.pointFlows.find((p) => p.refId === `revoke:${order.recordId}`)
+  assert(refundFlow && refundFlow.bizDate === day2 && refundFlow.date === day2,
+    `退款流水归属审核处理日 day2（bizDate=${refundFlow?.bizDate}、date=${refundFlow?.date}；终态虽落于 day3，归属不漂移）`)
+  assert(app.k.state.pointFlows.filter((p) => p.refId === `revoke:${order.recordId}`).length === 1, '退款流水仅一笔（续办幂等）')
+  // P1 三天均平衡：day1 冻结成本 -10；day2 撤销返还 +10；day3 无发生额
+  for (const [d, expectNet] of [[day1, -10], [day2, 10], [day3, 0]]) {
+    const r1 = app.recon.compute(d, 't-star')
+    assert(r1.points.residual === 0 && r1.openCount === 0,
+      `P1 ${d} 账实相符（残差=${r1.points.residual}，应有净额=${r1.points.expectedNet}，期望 ${expectNet}）`)
+  }
+  await app.k.close()
+}
+
+// 跨日续办统一锚点：风控放行 Saga 在核销预占后崩溃、隔日续办——
+// reviewedAt 锚定审核处理日；任务奖励仍归属原参与业务日、grantDate=实际发放日（续办当日）。
+async function testReleaseCrashCrossDayResume() {
+  console.log('— 风控放行 Saga 隔日续办：审核日锚定 + 任务跨日补计不串账 —')
+  const db = tmpDb('release-cross')
+  let app = await createApp({ dbFile: db })
+  const day1 = '2026-09-20'
+  const day2 = '2026-09-21'
+  const day3 = '2026-09-22'
+  app.k.setBusinessDay(day1)
+  app.k.state.riskRules['t-star'] = {
+    ...app.k.state.riskRules['t-star'], enabled: true,
+    highValueRarities: ['legendary', 'epic'], dailyDrawThreshold: 0,
+    rapidDrawMax: 0, rapidDrawSeconds: 0, blacklist: []
+  }
+  const act = app.k.state.activities.find((a) => a.id === 'act-1')
+  await app.k.commit([{ type: 'upsert', table: 'activities', row: { ...act, dailyLimit: 10, totalLimit: 100, prizes: act.prizes.map((p) => ({ ...p, weight: p.id === 'p2' ? 100 : 0 })) } }])
+  const ctx = customerCtx(app)
+  const frozenDraw = await app.trade.draw('act-1', ctx, { idempotencyKey: 'rl-cross' })
+  const orderId = frozenDraw.trade.riskOrderId
+  // 再补 2 次谢谢参与（day1 有效参与=2，冻结暂缓计入）
+  app.k.state.riskRules['t-star'].enabled = false
+  const ap = app.k.state.activities.find((a) => a.id === 'act-1')
+  await app.k.commit([{ type: 'upsert', table: 'activities', row: { ...ap, prizes: ap.prizes.map((p) => ({ ...p, weight: p.rarity === 'none' ? 100 : 0 })) } }])
+  await app.trade.draw('act-1', ctx, { idempotencyKey: 'rl-n1' })
+  await app.trade.draw('act-1', ctx, { idempotencyKey: 'rl-n2' })
+
+  // day2 放行：核销预占库存后崩溃
+  app.k.setBusinessDay(day2)
+  app.k.injectFault('release.afterConsume')
+  let crashed = null
+  try {
+    await app.risk.review(orderId, 'release', '跨日放行（隔日续办）', staffCtx(app, 'm-star-risk'))
+  } catch (e) { crashed = e }
+  assert(cashedOr(crashed), '放行 Saga 在核销预占后中断')
+  await app.k.close()
+
+  // day3 重启续办到终态
+  app = await createApp({ dbFile: db, autoResume: false })
+  app.k.setBusinessDay(day3)
+  const resumed = await app.risk.resumeProcessing()
+  assert(resumed.includes(orderId), '启动续办接管崩溃的放行单')
+  const order = app.k.state.riskOrders.find((o) => o.id === orderId)
+  assert(order.status === 'released' && order.reviewedAt.startsWith(day2),
+    `审核时间归属实际处理日 day2（reviewedAt=${order.reviewedAt}）`)
+  // 任务跨日补计：台账归属 day1、实际发放日 day3（续办当日）
+  const claim = app.k.state.taskClaims.find((c) => c.bizDate === day1 && c.userId === 'u-1001')
+  assert(!!claim && claim.grantDate === day3 && claim.reward === 15,
+    `任务补计分账：bizDate=${day1}、grantDate=${day3}（实际 ${claim?.bizDate}/${claim?.grantDate}）`)
+  const claimFlow = app.k.state.pointFlows.find((p) => p.refId === claim?.id)
+  assert(claimFlow && claimFlow.bizDate === day1 && claimFlow.date === day3, '补计流水 bizDate=day1、实际入账日 day3')
+  // 三天对账均平衡：任务奖励归属 day1，不串 day2/day3
+  for (const d of [day1, day2, day3]) {
+    const r1 = app.recon.compute(d, 't-star')
+    assert(r1.openCount === 0, `对账 ${d} 账实相符（open=${r1.openCount}，P1残差=${r1.points.residual}）`)
+  }
+  await app.k.close()
+}
+
+// 售后审核 Saga：拒收/退货与补发统一幂等续办——
+// 库存变动 effectId、退款 refId、补发单固定 id；崩溃/重试/隔日续办不重复扣减、不串账。
+async function testAfterSaleSagaResume() {
+  console.log('— 售后审核 Saga：崩溃续办幂等 + 跨日分账（退货退款 / 补发 / 待补货续办）—')
+  const db = tmpDb('as-saga')
+  let app = await createApp({ dbFile: db, autoResume: false })
+  // 关闭风控并写入 WAL（本用例多次重启，内存态关闭会在重放后失效）
+  await app.k.commit([{ type: 'risk-rules.put', tenantId: 't-star', rules: {
+    ...app.k.state.riskRules['t-star'], enabled: false, dailyDrawThreshold: 0, rapidDrawMax: 0, rapidRedeemMax: 0
+  } }])
+  const customer = customerCtx(app)
+  const shipStaff = staffCtx(app, 'm-star-ship')
+  const ops = staffCtx(app, 'm-star-ops')
+  const fin = staffCtx(app, 'm-star-fin')
+  const day1 = '2026-09-20'
+  const day2 = '2026-09-21'
+  app.k.setBusinessDay(day1)
+  const g3 = () => app.k.state.goods.find((g) => g.id === 'g3')
+
+  // 造两笔已签收订单（退货退款 / 补发各一）
+  const makeReceived = async (key) => {
+    const r = await app.trade.redeem('g3', customer, { idempotencyKey: key })
+    const sp = await app.ship.createForRecord(app.k.state.records.find((x) => x.id === r.trade.id))
+    await app.ship.submitAddress(sp.shipment.id,
+      { receiver: '张三', phone: '13812345678', region: '上海市浦东新区', address: '张江路1号' }, customer)
+    await app.ship.ship(sp.shipment.id, { carrier: '顺丰', trackingNo: `SF-${key}` }, shipStaff)
+    await app.ship.receive(sp.shipment.id, customer)
+    return sp.shipment
+  }
+  const spReturn = await makeReceived('as-ret')
+  const spReship = await makeReceived('as-reship')
+
+  // —— 退货退款：day1 审核，库存回补后崩溃，同日重启续办 ——
+  const asReturn = await app.ship.applyAfterSale(spReturn.id, 'return', '污渍退货', customer)
+  const balBefore = app.points.balanceOf('u-1001')
+  const remainBeforeReturn = g3().remain
+  app.k.injectFault('aftersale.afterRestock')
+  let crashed = null
+  try { await app.ship.reviewAfterSale(asReturn.id, true, '同意退货', shipStaff) } catch (e) { crashed = e }
+  assert(cashedOr(crashed), '退货审核在库存回补后中断（aftersale.afterRestock）')
+  assert(g3().remain === remainBeforeReturn + 1, '崩溃时库存已回补 1')
+  await app.k.close()
+  app = await createApp({ dbFile: db, autoResume: false })
+  app.k.setBusinessDay(day1)
+  const resumed1 = await app.ship.resumeAfterSales({ name: '系统启动续办' })
+  assert(resumed1.includes(asReturn.id), '启动续办接管崩溃的退货审核')
+  const doneReturn = app.k.state.afterSales.find((x) => x.id === asReturn.id)
+  assert(doneReturn.status === 'done' && doneReturn.reviewedAt.startsWith(day1) && doneReturn.fulfilledAt.startsWith(day1),
+    `退货单续办完成：审核日/履约日均归属 day1（${doneReturn.reviewedAt} / ${doneReturn.fulfilledAt}）`)
+  assert(g3().remain === remainBeforeReturn + 1, `库存仅回补一次（remain=${g3().remain}，续办未重复回补）`)
+  assert(app.points.balanceOf('u-1001') === balBefore + 150, `退款 +150 恰好一次（余额 ${app.points.balanceOf('u-1001')}）`)
+  assert(app.k.state.pointFlows.filter((p) => p.refId === asReturn.id && p.kind === 'refund').length === 1, '退款流水仅一笔')
+  const spReturnAfter = app.k.state.shipments.find((o) => o.id === spReturn.id)
+  assert(spReturnAfter.status === 'returned' && spReturnAfter.traces.filter((t) => t.stage === 'returned').length === 1,
+    '发货单已退回且退回轨迹不重复')
+
+  // —— 补发：day1 审核，扣库存后崩溃，day2 隔日续办 ——
+  const asReship = await app.ship.applyAfterSale(spReship.id, 'reship', '少件补发', customer)
+  const remainBeforeReship = g3().remain
+  app.k.injectFault('aftersale.afterDeduct')
+  crashed = null
+  try { await app.ship.reviewAfterSale(asReship.id, true, '同意补发', shipStaff) } catch (e) { crashed = e }
+  assert(cashedOr(crashed), '补发审核在扣库存后中断（aftersale.afterDeduct）')
+  await app.k.close()
+  app = await createApp({ dbFile: db, autoResume: false })
+  app.k.setBusinessDay(day2)
+  const resumed2 = await app.ship.resumeAfterSales({ name: '系统启动续办' })
+  assert(resumed2.includes(asReship.id), '隔日续办接管崩溃的补发审核')
+  const doneReship = app.k.state.afterSales.find((x) => x.id === asReship.id)
+  assert(doneReship.status === 'done' && doneReship.reviewedAt.startsWith(day1) && doneReship.fulfilledAt.startsWith(day1),
+    `补发单跨日续办：审核日/履约日锚定 day1（${doneReship.reviewedAt} / ${doneReship.fulfilledAt}）`)
+  assert(g3().remain === remainBeforeReship - 1, `补发库存仅扣一次（remain=${g3().remain}）`)
+  const reshipments = app.k.state.shipments.filter((o) => o.afterSaleId === asReship.id)
+  assert(reshipments.length === 1 && reshipments[0].id === `sp-reship-${asReship.id}` && reshipments[0].date === day1,
+    `补发发货单唯一且固定 id（${reshipments[0]?.id}），归属业务日 day1`)
+  const spReshipAfter = app.k.state.shipments.find((o) => o.id === spReship.id)
+  assert(spReshipAfter.traces.filter((t) => t.stage === 'reship').length === 1, '原单补发受理轨迹不重复')
+  // 完成后重复审核幂等拦截
+  let dup = null
+  try { await app.ship.reviewAfterSale(asReship.id, true, '重试', shipStaff) } catch (e) { dup = e }
+  assert(dup instanceof BizError && dup.code === 'IDEMPOTENT', '已完成售后单重复审核被拦截')
+  const again = await app.ship.resumeAfterSales({ name: '测试' })
+  assert(again.length === 0, '再次扫描无遗留 processing 售后单（续办幂等）')
+
+  // —— 待补货跨日续办：day1 缺货挂起（记首次审核日），day2 采购入库后继续履约（履约日=day2）——
+  app.k.setBusinessDay(day1)
+  const spWait = await makeReceived('as-wait')
+  const asWait = await app.ship.applyAfterSale(spWait.id, 'reship', '破损补发', customer)
+  const consumed = app.k.state.records.filter((r) => r.type === 'redeem' && r.goodsId === 'g3' && r.status !== 'revoked').length
+  const doneAs = app.k.state.afterSales.filter((a) => a.status === 'done' && a.targetType === 'goods' && a.targetId === 'g3')
+  const returnedN = doneAs.filter((a) => ['reject', 'return'].includes(a.type)).length
+  const reshippedN = doneAs.filter((a) => a.type === 'reship').length
+  await app.k.commit([{ type: 'upsert', table: 'goods', row: { ...g3(), remain: 0, stock: consumed - returnedN + reshippedN } }])
+  const waiting = await app.ship.reviewAfterSale(asWait.id, true, '缺货挂起', shipStaff)
+  assert(waiting.status === 'waiting_stock' && waiting.reviewedAt.startsWith(day1), '缺货挂起：待补货并记录首次审核日 day1')
+  // day2 采购入库后继续履约
+  app.k.setBusinessDay(day2)
+  const po = await app.purchase.createOrder(
+    { targetType: 'goods', targetId: 'g3', qty: 5, reason: '补发采购', afterSaleId: asWait.id, supplierName: '供应商A', unitPrice: 22 }, ops)
+  await app.purchase.reviewOrder(po.id, true, '加急', fin)
+  await app.purchase.inbound(po.id, { qty: 5 }, shipStaff)
+  const cont = await app.ship.reviewAfterSale(asWait.id, true, '到货继续履约', shipStaff)
+  assert(cont.status === 'done' && cont.reviewedAt.startsWith(day1) && cont.fulfilledAt.startsWith(day2),
+    `待补货跨日续办分账：审核日=${day1}、履约日=${day2}（实际 ${cont.reviewedAt} / ${cont.fulfilledAt}）`)
+  assert(app.k.state.shipments.filter((o) => o.afterSaleId === asWait.id).length === 1, '续办补发单唯一')
+
+  // 两日对账均平衡（P1 退款归属 day1；P5 库存账实勾稽）
+  for (const d of [day1, day2]) {
+    const r1 = app.recon.compute(d, 't-star')
+    assert(r1.openCount === 0,
+      `对账 ${d} 账实相符（open=${r1.openCount}，P1残差=${r1.points.residual}，P5差异=${r1.stock.filter((x) => x.diff !== 0).length}）`)
+  }
+  assert(app.k.state.auditLogs.some((l) => l.action === 'aftersale-approve'), '售后审核通过留痕')
   await app.k.close()
 }
 
@@ -667,6 +896,9 @@ async function main() {
   await testIdempotency()
   await testCrashResume()
   await testReleaseCrashAndCrossDay()
+  await testRevokeCrashCrossDay()
+  await testReleaseCrashCrossDayResume()
+  await testAfterSaleSagaResume()
   await testRecon()
   await testPurchase()
   await testPurchaseConcurrency()

@@ -140,8 +140,10 @@ export class RiskService {
       appealReason: '', appealAt: '', reviewNote: '', reviewer: '',
       createdAt: this.k.todayDate(), time: this.k.nowTime(), ts: this.k.nowTs(),
       reviewedAt: '',
-      // 续办：审核动作执行中标记（崩溃后 boot 扫描 processing 单继续完成）
-      processing: '', processingRunId: '',
+      // 续办：审核动作执行中标记（崩溃后 boot 扫描 processing 单继续完成）；
+      // processDay=审核实际处理日锚点（登记于审核动作发起时），退款流水 bizDate 与 reviewedAt 均以它归属，
+      // 跨日续办（故障后隔日恢复）也不串账：归属业务日=processDay、实际落账日=流水.date 另记。
+      processing: '', processingRunId: '', processDay: '',
       stages: {}
     }
     await this.k.commit([{ type: 'insert', table: 'riskOrders', row: order }])
@@ -170,7 +172,7 @@ export class RiskService {
     return row
   }
 
-  // 放行/撤销统一入口：先登记 processing 标记（续办锚点），再执行幂等 Saga
+  // 放行/撤销统一入口：先登记 processing 标记（续办锚点）+ 实际处理日 processDay，再执行幂等 Saga
   async review(orderId, action, note, ctx) {
     const o = this.k.state.riskOrders.find((x) => x.id === orderId)
     if (!o) throw new BizError('ORDER_NOT_FOUND', '审核单不存在', 404)
@@ -181,7 +183,10 @@ export class RiskService {
       const runId = genId('run')
       await this.k.commit([{
         type: 'upsert', table: 'riskOrders',
-        row: { ...o, processing: action, processingRunId: runId, stages: {}, reviewer: ctx.name }
+        row: {
+          ...o, processing: action, processingRunId: runId, stages: {}, reviewer: ctx.name,
+          reviewNote: (note || '').trim(), processDay: this.k.todayDate()
+        }
       }])
     }
     if (action === 'release') await this._completeRelease(orderId, note, ctx)
@@ -200,6 +205,9 @@ export class RiskService {
     if (!rec) throw new BizError('RECORD_MISSING', '关联业务记录缺失，无法处理', 409)
     const traceId = rec.traceId || this.k.newTraceId()
     const tid = o0.tenantId
+    // 实际处理日锚点：审核动作发起日（跨日续办沿用，不按续办当日漂移）
+    const processDay = o0.processDay || this.k.todayDate()
+    const remark = o0.reviewNote || note || ''
 
     // 1) 核销预占库存（幂等 effectId；续办重放不重复核销）
     if (o0.stockHeld && !o0.stages.consume) {
@@ -237,12 +245,12 @@ export class RiskService {
       }
     }
 
-    // 3) 单据/记录终态
+    // 3) 单据/记录终态（审核时间归属实际处理日 processDay；跨日续办不改写归属）
     const o1 = this.k.state.riskOrders.find((x) => x.id === orderId)
     await this.k.commit([
       { type: 'upsert', table: 'riskOrders', row: {
-          ...o1, status: 'released', reviewNote: note || '', reviewer: o1.reviewer || ctx.name,
-          reviewedAt: `${this.k.todayDate()} ${this.k.nowTime()}`,
+          ...o1, status: 'released', reviewNote: remark, reviewer: o1.reviewer || ctx.name,
+          reviewedAt: `${processDay} ${this.k.nowTime()}`,
           processing: '', processingRunId: ''
         } },
       { type: 'upsert', table: 'records', row: { ...rec, status: 'released' } }
@@ -268,7 +276,7 @@ export class RiskService {
 
     if (!this.k.state.riskOrders.find((x) => x.id === orderId).stages.audit) {
       await this.audit.log('release', orderId,
-        `放行${o0.bizType === 'draw' ? '抽奖' : '兑换'}【${o0.targetName}】${note ? '；备注：' + note : ''}`,
+        `放行${o0.bizType === 'draw' ? '抽奖' : '兑换'}【${o0.targetName}】${remark ? '；备注：' + remark : ''}`,
         { tenantId: tid, ctx, traceId })
       await this._setStage(this.k.state.riskOrders.find((x) => x.id === orderId), 'audit')
     }
@@ -280,13 +288,16 @@ export class RiskService {
     if (!rec) throw new BizError('RECORD_MISSING', '关联业务记录缺失，无法处理', 409)
     const traceId = rec.traceId || this.k.newTraceId()
     const tid = o0.tenantId
+    // 实际处理日锚点：撤销动作发起日（跨日续办沿用，退款归属与 reviewedAt 不漂移）
+    const processDay = o0.processDay || this.k.todayDate()
+    const remark = o0.reviewNote || note || ''
 
-    // 1) 返还冻结成本积分（幂等：refId revoke:<recId>）
+    // 1) 返还冻结成本积分（幂等：refId revoke:<recId>；bizDate=审核实际处理日，date=实际落账日，跨日续办不串账）
     if (o0.frozenPoints > 0 && !o0.stages.refund) {
       await this.points.post({
         userId: rec.userId, delta: o0.frozenPoints,
         note: `撤销返还：${o0.bizType === 'draw' ? '抽奖' : '兑换'}【${o0.targetName}】`,
-        kind: 'refund', tenantId: tid,
+        kind: 'refund', tenantId: tid, bizDate: processDay,
         refId: `revoke:${rec.id}`, refType: 'risk-revoke', traceId
       })
       await this._setStage(this.k.state.riskOrders.find((x) => x.id === orderId), 'refund')
@@ -317,8 +328,8 @@ export class RiskService {
     const o1 = this.k.state.riskOrders.find((x) => x.id === orderId)
     await this.k.commit([
       { type: 'upsert', table: 'riskOrders', row: {
-          ...o1, status: 'revoked', reviewNote: note || '', reviewer: o1.reviewer || ctx.name,
-          reviewedAt: `${this.k.todayDate()} ${this.k.nowTime()}`,
+          ...o1, status: 'revoked', reviewNote: remark, reviewer: o1.reviewer || ctx.name,
+          reviewedAt: `${processDay} ${this.k.nowTime()}`,
           processing: '', processingRunId: ''
         } },
       { type: 'upsert', table: 'records', row: { ...rec, status: 'revoked' } }
@@ -332,7 +343,7 @@ export class RiskService {
 
     if (!this.k.state.riskOrders.find((x) => x.id === orderId).stages.audit) {
       await this.audit.log('revoke', orderId,
-        `撤销${o0.bizType === 'draw' ? '抽奖' : '兑换'}【${o0.targetName}】，返还${o0.frozenPoints}积分${o0.stockHeld ? `、回补库存×${o0.stockHeld}` : ''}${rec.couponId ? '、释放预占券（未发放）' : ''}${o0.bizType === 'draw' ? '；该笔不计入抽奖任务进度（冻结期间暂缓，撤销后确认回退）' : ''}${note ? '；备注：' + note : ''}`,
+        `撤销${o0.bizType === 'draw' ? '抽奖' : '兑换'}【${o0.targetName}】，返还${o0.frozenPoints}积分${o0.stockHeld ? `、回补库存×${o0.stockHeld}` : ''}${rec.couponId ? '、释放预占券（未发放）' : ''}${o0.bizType === 'draw' ? '；该笔不计入抽奖任务进度（冻结期间暂缓，撤销后确认回退）' : ''}${remark ? '；备注：' + remark : ''}`,
         { tenantId: tid, ctx, traceId })
       await this._setStage(this.k.state.riskOrders.find((x) => x.id === orderId), 'audit')
     }
