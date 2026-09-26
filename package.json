@@ -1,0 +1,34 @@
+{
+  "name": "lottery-platform",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "test:settle": "esbuild scripts/smoke-settle.mjs --bundle --format=esm --platform=node --alias:@=./src --outfile=node_modules/.cache/smoke-settle.bundle.mjs --log-level=warning && node node_modules/.cache/smoke-settle.bundle.mjs",
+    "test:recon": "esbuild scripts/smoke-recon.mjs --bundle --format=esm --platform=node --alias:@=./src --outfile=node_modules/.cache/smoke-recon.bundle.mjs --log-level=warning && node node_modules/.cache/smoke-recon.bundle.mjs",
+    "test:ship": "esbuild scripts/smoke-ship.mjs --bundle --format=esm --platform=node --alias:@=./src --outfile=node_modules/.cache/smoke-ship.bundle.mjs --log-level=warning && node node_modules/.cache/smoke-ship.bundle.mjs",
+    "test:aftersale": "esbuild scripts/smoke-aftersale.mjs --bundle --format=esm --platform=node --alias:@=./src --outfile=node_modules/.cache/smoke-aftersale.bundle.mjs --log-level=warning && node node_modules/.cache/smoke-aftersale.bundle.mjs",
+    "test:purchase": "esbuild scripts/smoke-purchase.mjs --bundle --format=esm --platform=node --alias:@=./src --outfile=node_modules/.cache/smoke-purchase.bundle.mjs --log-level=warning && node node_modules/.cache/smoke-purchase.bundle.mjs",
+    "test:supplier": "esbuild scripts/smoke-supplier.mjs --bundle --format=esm --platform=node --alias:@=./src --outfile=node_modules/.cache/smoke-supplier.bundle.mjs --log-level=warning && node node_modules/.cache/smoke-supplier.bundle.mjs",
+    "test:budget": "esbuild scripts/smoke-budget.mjs --bundle --format=esm --platform=node --alias:@=./src --outfile=node_modules/.cache/smoke-budget.bundle.mjs --log-level=warning && node node_modules/.cache/smoke-budget.bundle.mjs",
+    "test:coupon": "esbuild scripts/smoke-coupon.mjs --bundle --format=esm --platform=node --alias:@=./src --outfile=node_modules/.cache/smoke-coupon.bundle.mjs --log-level=warning && node node_modules/.cache/smoke-coupon.bundle.mjs",
+    "test:tenant": "esbuild scripts/smoke-tenant.mjs --bundle --format=esm --platform=node --alias:@=./src --outfile=node_modules/.cache/smoke-tenant.bundle.mjs --log-level=warning && node node_modules/.cache/smoke-tenant.bundle.mjs",
+    "test:server": "node scripts/smoke-server.mjs",
+    "test:budget-server": "node scripts/smoke-budget-server.mjs",
+    "test:migration": "esbuild scripts/smoke-migration.mjs --bundle --format=esm --platform=node --alias:@=./src --outfile=node_modules/.cache/smoke-migration.bundle.mjs --log-level=warning && node node_modules/.cache/smoke-migration.bundle.mjs",
+    "test:http": "node scripts/smoke-http.mjs",
+    "test:bridge": "node scripts/smoke-bridge.mjs",
+    "server": "node server/index.js"
+  },
+  "dependencies": {
+    "pinia": "^2.1.7",
+    "vue": "^3.4.21"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.0.4",
+    "vite": "^5.2.8"
+  }
+}
