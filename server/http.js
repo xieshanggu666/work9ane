@@ -640,7 +640,8 @@ async function route(app, req, res, json, ctx = {}) {
     if (session.identityKind !== 'platform') throw new BizError('FORBIDDEN', '仅平台方可执行续办', 403)
     const trades = await app.trade.resumeAll(session)
     const orders = await app.risk.resumeProcessing()
-    return reply(res, 200, { ok: true, resumedTrades: trades, resumedOrders: orders })
+    const afterSales = await app.ship.resumeProcessing()
+    return reply(res, 200, { ok: true, resumedTrades: trades, resumedOrders: orders, resumedAfterSales: afterSales })
   }
   if (method === 'POST' && p === '/api/admin/day') {
     if (session.identityKind !== 'platform') throw new BizError('FORBIDDEN', '仅平台方可切换业务日', 403)

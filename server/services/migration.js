@@ -119,9 +119,13 @@ export class MigrationService {
       add({ type: 'risk-rules.put', tenantId, rules: JSON.parse(JSON.stringify(rules)) }))
     ;(snap.couponTplsList || snap.couponTpls || []).forEach((c) => add({ type: 'upsert', table: 'couponTpls', row: { ...c } }))
 
-    // 活动/商品（库存保持旧账面值，含 remain/frozen）
-    ;(snap.activities || []).forEach((a) => add({ type: 'upsert', table: 'activities', row: JSON.parse(JSON.stringify(a)) }))
-    ;(snap.goods || []).forEach((g) => add({ type: 'upsert', table: 'goods', row: { ...g } }))
+    // 活动/商品：库存账面从 0 起，由下方重建的库存台账（opening + 逐笔变动）投影出
+    // 快照期末 remain/frozen/stock，避免「快照终值 + 台账变动」双重叠加。
+    ;(snap.activities || []).forEach((a) => add({ type: 'upsert', table: 'activities', row: JSON.parse(JSON.stringify({
+      ...a,
+      prizes: (a.prizes || []).map((p) => ({ ...p, remain: 0, frozen: 0, stock: 0 }))
+    })) }))
+    ;(snap.goods || []).forEach((g) => add({ type: 'upsert', table: 'goods', row: { ...g, remain: 0, frozen: 0, stock: 0 } }))
 
     // 积分流水：固定 id + 固定 effectId，重放幂等；按 ts 正序提交以重建余额快照。
     // 旧平台钱包流水没有 userId（单消费者时代），统一归属到迁移快照指定的 legacyOwner（默认 u-1001）。
@@ -202,6 +206,102 @@ export class MigrationService {
         const row = dateTables[table] ? dateTables[table](JSON.parse(JSON.stringify(row0))) : JSON.parse(JSON.stringify(row0))
         add({ type: 'insert', table, row })
       })
+    })
+
+    // 库存台账重建（与服务端运行库同构）：期初 opening + 按业务事实重建每笔 remain 变动，
+    // 使迁移库的 P5 同样支持按业务日/实际处理日双口径分账。行 id/effectId 固定，重跑幂等。
+    const dayOfTs2 = (ts, fallback) => {
+      if (!ts) return fallback
+      const d = new Date(ts)
+      const p = (n) => String(n).padStart(2, '0')
+      return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
+    }
+    const stockEvents = []
+    const pushStockEv = (key, ev) => stockEvents.push({ key, ...ev })
+    const tOfRec = (r) => r.type === 'draw' ? `prize:${r.activityId}:${r.prizeId}` : `goods:${r.goodsId}`
+    const findRow = (key) => {
+      if (key.startsWith('prize:')) {
+        const rest = key.slice('prize:'.length); const i = rest.indexOf(':')
+        const a = (snap.activities || []).find((x) => x.id === rest.slice(0, i))
+        return a?.prizes.find((p) => p.id === rest.slice(i + 1))
+      }
+      return (snap.goods || []).find((g) => g.id === key.slice('goods:'.length))
+    }
+    // 期初：以快照账面总量 stock 作为 opening（初始库存）
+    ;[...(snap.activities || []).flatMap((a) => (a.prizes || [])
+        .filter((p) => p.rarity !== 'none')
+        .map((p) => ({ key: `prize:${a.id}:${p.id}`, stock: p.stock, tenantId: a.tenantId }))),
+      ...(snap.goods || []).map((g) => ({ key: `goods:${g.id}`, stock: g.stock, tenantId: g.tenantId || 't-star' }))
+    ].forEach((t) => {
+      if (!findRow(t.key)) return
+      add({ type: 'stock.opening', key: t.key, stock: t.stock, bizDate: '0000-01-01', ts: 0, tenantId: t.tenantId })
+    })
+    // 业务记录：参与/冻结当日预占/扣减 -1；放行按冻结业务日核销预占（remain 已在参与日扣，不再动 remain）；
+    // 撤销在审核日回补 +1。
+    ;(snap.records || []).forEach((r) => {
+      if (r.prizeId && (() => { const a = (snap.activities || []).find((x) => x.id === r.activityId); return a?.prizes.find((p) => p.id === r.prizeId)?.rarity === 'none' })()) return
+      const key = tOfRec(r)
+      if (!findRow(key)) return
+      const day = dayOfTs2(r.ts, r.date)
+      const o = (snap.riskOrders || []).find((x) => x.recordId === r.id)
+      // 参与即占可用余量（含后被撤销的笔，撤销另在审核日回补 frozen 与 remain）
+      pushStockEv(key, {
+        dRemain: -1, dFrozen: o ? 1 : 0,
+        kind: o ? 'hold' : (r.type === 'draw' ? 'draw-deduct' : 'redeem-deduct'),
+        bizDate: day, date: day, refType: 'record', refId: r.id,
+        tenantId: r.tenantId || 't-star', traceId: r.traceId || '',
+        effectId: o ? `freeze-stock:${r.id}` : (r.type === 'draw' ? `draw-stock:${r.id}` : `redeem-stock:${r.id}`),
+        ts: r.ts
+      })
+      if (r.status === 'released' && o) {
+        const revTs2 = (o.reviewedAt ? Date.parse((o.reviewedAt || '').replace(' ', 'T')) : o.ts) || (r.ts + 1)
+        pushStockEv(key, {
+          dRemain: 0, dFrozen: -1, kind: 'consume-held',
+          bizDate: dayOfTs2(o.ts, o.createdAt || day), date: dayOfTs2(revTs2, day),
+          refType: 'risk-order', refId: o.id, tenantId: o.tenantId || r.tenantId || 't-star',
+          traceId: r.traceId || '', effectId: `release-consume:${o.id}`, ts: revTs2
+        })
+      }
+      if (r.status === 'revoked' && o) {
+        const revTs = o.reviewedAt ? Date.parse((o.reviewedAt || '').replace(' ', 'T')) : (o.ts || r.ts)
+        const revDay = dayOfTs2(revTs, day)
+        pushStockEv(key, {
+          dRemain: 1, dFrozen: -1, kind: 'revoke-restock',
+          bizDate: revDay, date: revDay, refType: 'risk-order', refId: o.id,
+          tenantId: o.tenantId || r.tenantId || 't-star', traceId: r.traceId || '',
+          effectId: `revoke-restock:${o.id}`, ts: revTs
+        })
+      }
+    })
+    // 售后：退回/拒收审核日回补 +1；补发审核日再扣 -1（按审核日实际处理日归属）
+    ;(snap.afterSales || []).filter((a) => a.status === 'done').forEach((a) => {
+      const key = a.targetType === 'prize' ? `prize:${a.activityId}:${a.targetId}` : `goods:${a.targetId}`
+      if (!findRow(key)) return
+      const ts = a.reviewedAt ? Date.parse((a.reviewedAt || '').replace(' ', 'T')) : a.ts
+      const day = dayOfTs2(ts, a.createdAt)
+      if (['reject', 'return'].includes(a.type)) {
+        pushStockEv(key, { dRemain: 1, dFrozen: 0, kind: 'aftersale-return', bizDate: day, date: day,
+          refType: 'aftersale', refId: a.id, tenantId: a.tenantId || 't-star', traceId: a.traceId || '',
+          effectId: `as-restock:${a.id}`, ts })
+      } else if (a.type === 'reship') {
+        pushStockEv(key, { dRemain: -1, dFrozen: 0, kind: 'aftersale-reship', bizDate: day, date: day,
+          refType: 'aftersale', refId: a.id, tenantId: a.tenantId || 't-star', traceId: a.traceId || '',
+          effectId: `as-reship:${a.id}`, ts })
+      }
+    })
+    // 对账调整凭证：按差异单业务日
+    ;(snap.stockAdjustments || []).forEach((x) => {
+      const key = x.targetKey
+      if (!findRow(key)) return
+      const day = dayOfTs2(x.ts, x.date)
+      pushStockEv(key, { dRemain: x.delta, dFrozen: 0, kind: 'recon-adjust', bizDate: x.bizDate || day, date: day,
+        refType: 'recon-bill', refId: x.id, tenantId: x.tenantId || 't-star', traceId: x.traceId || '',
+        effectId: `recon-adjust:${x.id}`, ts: x.ts })
+    })
+    stockEvents.sort((a, b) => (a.ts || 0) - (b.ts || 0))
+    stockEvents.forEach((ev) => {
+      const { key, ...rest } = ev
+      add({ type: 'inv.mut', key, ...rest })
     })
 
     // 逐事件提交（单 WAL；中途崩溃重启后固定 id/effectId 重放幂等，批次 manifest 未落库则可安全重跑）

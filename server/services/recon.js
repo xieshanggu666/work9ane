@@ -185,11 +185,22 @@ export class ReconService {
     }))
     goodsT.forEach((g) => checkHeld(`goods:${g.id}`, g.name, g.frozen))
 
-    // —— P5 库存账实 ——
+    // —— P5 库存账实（按业务日分账：业务视角 bizDate / 处理日视角 date 双口径）——
+    // 跨日续办统一归属：
+    //   正常/冻结扣减、预占         → 参与业务日 r.date
+    //   风控放行核销预占（消耗成立）→ 冻结业务日 order.createdAt（库存台账 consume-held.bizDate）
+    //   风控撤销回补               → 实际审核日
+    //   售后退回回补 / 补发再扣    → 实际审核日（跨日售后不串申请日）
+    //   采购验收入库 / 对账调整     → 验收日 / 差异单业务日
+    // 截至业务日 D 的「应有 remain」= 期初 + 采购入库(≤D) − 有效消耗(≤D) + 调整凭证(≤D)，
+    // 「实际 remain」= 库存台账按实际处理日重放到 D 的 remain（无台账旧库回退实时账面）。
     const doneAfterSales = afterSalesT.filter((a) => a.status === 'done')
-    const afterSaleOf = (targetType, activityId, targetId) => {
+    // 售后单的库存修正归属日（= 实际审核处理日；done 单必有 reviewedAt）
+    const asProcDate = (a) => (a.reviewedAt || '9999-12-31 23:59').slice(0, 10)
+    const afterSaleOfAsOf = (targetType, activityId, targetId, day) => {
       const hit = doneAfterSales.filter((a) => a.targetType === targetType && a.targetId === targetId &&
-        (targetType !== 'prize' || a.activityId === activityId))
+        (targetType !== 'prize' || a.activityId === activityId) &&
+        a.status === 'done' && !!a.reviewedAt && asProcDate(a) <= day)
       return {
         returned: hit.filter((a) => ['reject', 'return'].includes(a.type)).length,
         reshipped: hit.filter((a) => a.type === 'reship').length
@@ -199,23 +210,49 @@ export class ReconService {
     const pushStock = (targetType, activityId, id, name, icon, item) => {
       const isPrize = targetType === 'prize'
       const heldKey = isPrize ? `prize:${activityId}:${id}` : `goods:${id}`
-      const consumedBase = recordsT.filter(
-        (r) => r.status !== 'revoked' &&
-          (isPrize ? (r.type === 'draw' && r.activityId === activityId && r.prizeId === id)
-                   : (r.type === 'redeem' && r.goodsId === id))
-      ).length
-      const asFix = afterSaleOf(targetType, activityId, id)
-      const consumed = consumedBase - asFix.returned + asFix.reshipped
-      const adjusted = stockAdjT.filter((x) => x.targetKey === heldKey).reduce((s, x) => s + x.delta, 0)
-      const expected = item.stock - consumed + adjusted
-      const diff = expected - item.remain
-      if (diff !== 0) {
-        stockItems.push({
-          key: `stock-${heldKey}`, targetType, activityId, targetId: id, targetKey: heldKey,
-          name, icon, stock: item.stock, consumed, adjusted, expected, actual: item.remain,
-          diff, frozenHeld: heldByTarget.get(heldKey) || 0, frozenBook: item.frozen || 0, autoFixable: diff !== 0
-        })
-      }
+      const matchRec = (r) => isPrize
+        ? (r.type === 'draw' && r.activityId === activityId && r.prizeId === id)
+        : (r.type === 'redeem' && r.goodsId === id)
+      // 截至 D 的有效消耗（按事件归属日重建，而非当前状态）：
+      //  参与/冻结当日即占用可用余量（normal/frozen/released/revoked 在 r.date 都 -1）；
+      //  撤销在审核日回补（+1）——净消耗 = 全部参与(≤D) − 已撤销且审核日≤D；
+      //  售后退回在审核日回补（−1 消耗）、补发再扣（+1 消耗）。
+      const allParticipated = recordsT.filter((r) => matchRec(r) && r.date <= date).length
+      const revokedRestored = recordsT.filter((r) => matchRec(r) && r.status === 'revoked' &&
+        r.date <= date && (this.reviewDate(this.orderOfRecord(r.id)) || '9999') <= date).length
+      const asFix = afterSaleOfAsOf(targetType, activityId, id, date)
+      const consumed = allParticipated - revokedRestored - asFix.returned + asFix.reshipped
+      // 采购入库（台账 purchase-inbound，按验收业务日）；无台账时回退当前账面总量
+      const opening = this.k.stockOpening(heldKey)
+      const openingStock = opening ? opening.dStock : item.stock
+      const inboundByLedger = this.k.stockInboundAsOf(heldKey, date)
+      const inbound = opening ? inboundByLedger : 0
+      const adjusted = stockAdjT.filter((x) => x.targetKey === heldKey && (x.bizDate || x.date) <= date)
+        .reduce((s, x) => s + x.delta, 0)
+      // 非业务/非入库的纯账面调整台账行（如测试/迁移夹具盘点修正，只动 remain 不改物理总量），
+      // 并入应有 remain，避免把夹具修正误报为盘亏；正常业务种类（hold/扣减/回补/补发/入库）已含在上方公式。
+      const BUSINESS_KINDS = ['opening', 'purchase-inbound', 'hold', 'consume-held',
+        'draw-deduct', 'redeem-deduct', 'revoke-restock', 'aftersale-return', 'aftersale-reship', 'mut']
+      const otherAdjust = this.k.state.stockLedger
+        .filter((x) => x.key === heldKey && (x.bizDate || x.date) <= date && !BUSINESS_KINDS.includes(x.kind))
+        .reduce((s, x) => s + (x.dRemain || 0), 0)
+      // 应有（业务账）：期初 + 入库 − 有效消耗 + 对账调整凭证 + 其他账面调整
+      const expected = openingStock + inbound - consumed + adjusted + otherAdjust
+      // 实际：当日以实物账面（live remain，可检出盘亏/盘盈）；历史业务日按库存台账实际处理日重放
+      // （D 之后的跨日续办动作不串入历史业务日）。无台账旧库回退实时账面。
+      const ledgerActual = this.k.stockRemainAsOf(heldKey, date, 'date')
+      const actual = date === this.k.todayDate() ? item.remain
+        : (ledgerActual === null ? item.remain : ledgerActual)
+      const diff = expected - actual
+      // P5 全量返回每个 SKU 的业务日勾稽行（历史业务日平衡也可核对双口径），由 openCount 仅统计 diff≠0
+      stockItems.push({
+        key: `stock-${heldKey}`, targetType, activityId, targetId: id, targetKey: heldKey,
+        name, icon, stock: openingStock + inbound, inbound, opening: openingStock,
+        consumed, allParticipated, revokedRestored,
+        asReturned: asFix.returned, asReshipped: asFix.reshipped,
+        adjusted, expected, actual, liveRemain: item.remain,
+        diff, frozenHeld: heldByTarget.get(heldKey) || 0, frozenBook: item.frozen || 0, autoFixable: diff !== 0
+      })
     }
     actsT.forEach((a) => a.prizes.forEach((p) => {
       if (p.rarity !== 'none') pushStock('prize', a.id, p.id, `${a.name} / ${p.name}`, p.emoji, p)

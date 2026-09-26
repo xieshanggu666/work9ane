@@ -11,12 +11,19 @@ const TRACE_FLOW = (o) => [
 ]
 
 export class ShipService {
-  constructor(k, audit, points, inventory, budget) {
+  constructor(k, audit, points, inventory, budget, locks = null) {
     this.k = k
     this.audit = audit
     this.points = points
     this.inventory = inventory
     this.budget = budget
+    this.locks = locks
+  }
+
+  // 售后审核按售后单串行（与采购入库同款临界区），杜绝并发审核导致的重复扣库存/重复补发
+  withAfterSaleLock(afterSaleId, fn) {
+    if (!this.locks) return fn()
+    return this.locks.run(`as:${afterSaleId}`, fn)
   }
 
   isPhysical(rec) {
@@ -195,7 +202,9 @@ export class ShipService {
       refundPoints: type === 'reship' ? 0 : this.refundOfRecord(rec),
       reshipmentId: '',
       createdAt: this.k.todayDate(), time: this.k.nowTime(), ts: this.k.nowTs(),
-      reviewedAt: '', reviewer: '', reviewNote: ''
+      reviewedAt: '', reviewer: '', reviewNote: '',
+      // 续办：审核执行中标记（与交易/风控单同款 Saga；崩溃后 boot 扫描 processing 单继续完成）
+      processing: false, stages: {}
     }
     await this.k.commit([{ type: 'insert', table: 'afterSales', row: as }])
     await this.audit.log('aftersale-apply', as.id,
@@ -204,133 +213,237 @@ export class ShipService {
     return as
   }
 
-  async reviewAfterSale(afterSaleId, approve, note, ctx) {
-    const as = this.k.state.afterSales.find((x) => x.id === afterSaleId)
-    if (!as) throw new BizError('AS_NOT_FOUND', '售后单不存在', 404)
-    // waiting_stock：采购入库后的「继续履约」入口，仅补发单、仅同意继续可执行
-    const continuing = as.status === 'waiting_stock'
-    if (as.status !== 'pending' && !continuing) throw new BizError('IDEMPOTENT', '该售后单已处理，请勿重复操作', 409)
-    const o = this.requireShipment(as.shipmentId)
-    const remark = (note || '').trim()
-    const traceId = as.traceId || this.k.newTraceId()
+  async _setStage(as, name) {
+    if (as.stages?.[name]) return
+    await this.k.commit([{ type: 'upsert', table: 'afterSales', row: { ...as, stages: { ...(as.stages || {}), [name]: true } } }])
+  }
 
+  // 售后审核统一入口（与风控放行/撤销同款 Saga）：
+  // 先登记 processing 锚点，再按 stages 幂等执行；崩溃重启由 resumeProcessing() 续办到终态。
+  // 跨日落账：退款/回补/补发/预算均按「实际处理日（审核日）」归属业务日（申请日仅留痕），
+  // 库存台账与积分流水同时带 bizDate（=处理日）与 date，审计共享售后 traceId。
+  async reviewAfterSale(afterSaleId, approve, note, ctx) {
+    return this.withAfterSaleLock(afterSaleId, () => this._reviewLocked(afterSaleId, approve, note, ctx))
+  }
+
+  async _reviewLocked(afterSaleId, approve, note, ctx) {
+    const as0 = this.k.state.afterSales.find((x) => x.id === afterSaleId)
+    if (!as0) throw new BizError('AS_NOT_FOUND', '售后单不存在', 404)
+    // waiting_stock：采购入库后的「继续履约」入口，仅补发单、仅同意继续可执行
+    const continuing = as0.status === 'waiting_stock'
+    if (as0.status !== 'pending' && !continuing && !as0.processing) {
+      throw new BizError('IDEMPOTENT', '该售后单已处理，请勿重复操作', 409)
+    }
+    const remark = (note || '').trim()
+
+    // 驳回：单步留痕动作，不进入 Saga（不动账）
     if (!approve) {
       if (continuing) throw new BizError('STATE_DENIED', '待补货售后单仅可在采购入库后继续履约，不能驳回', 409)
-      const row = { ...as, status: 'dismissed', reviewedAt: `${this.k.todayDate()} ${this.k.nowTime()}`, reviewer: ctx.name, reviewNote: remark }
+      const row = { ...as0, status: 'dismissed', reviewedAt: `${this.k.todayDate()} ${this.k.nowTime()}`, reviewer: ctx.name, reviewNote: remark }
       await this.k.commit([{ type: 'upsert', table: 'afterSales', row }])
-      await this.audit.log('aftersale-dismiss', as.id,
-        `驳回${as.typeLabel}申请【${as.targetName}】（发货单 ${o.id}）${remark ? '；备注：' + remark : ''}；账目与库存未变动`,
-        { tenantId: as.tenantId, ctx, traceId })
+      const o0 = this.requireShipment(as0.shipmentId)
+      await this.audit.log('aftersale-dismiss', as0.id,
+        `驳回${as0.typeLabel}申请【${as0.targetName}】（发货单 ${o0.id}）${remark ? '；备注：' + remark : ''}；账目与库存未变动`,
+        { tenantId: as0.tenantId, ctx, traceId: as0.traceId })
       return row
     }
 
-    // 通过：统一预校验（库存目标存在；补发需有余量），任一不满足整体不落账
-    const target = this.inventory.targetOf(as.targetType, as.activityId, as.targetId)
-    if (as.type === 'reship' && target.row.remain <= 0) {
-      // 缺货：售后单挂起「待补货」（不动账），采购验收入库后可从待处理售后继续履约
-      // 补发资金成本实时预占（待采购结算时核销，不重复付款）；
-      // 已有关联采购单在途的（采购预占已覆盖补发件）不重复预占
+    // 通过：登记续办锚点（approve/重入直接按 stages 幂等续办）
+    if (!as0.processing) {
+      await this.k.commit([{
+        type: 'upsert', table: 'afterSales',
+        row: { ...as0, processing: true, reviewer: ctx.name, stages: as0.stages || {} }
+      }])
+    }
+    await this._completeAfterSale(afterSaleId, remark, ctx)
+    return this.k.state.afterSales.find((x) => x.id === afterSaleId)
+  }
+
+  // 审核通过（或待补货继续履约）的幂等执行体
+  async _completeAfterSale(afterSaleId, remark, ctx) {
+    const as0 = this.k.state.afterSales.find((x) => x.id === afterSaleId)
+    const o = this.requireShipment(as0.shipmentId)
+    const traceId = as0.traceId || this.k.newTraceId()
+    const procDay = this.k.todayDate() // 实际处理日（跨日审核按审核日入账，不串申请日）
+    const stamp = `${procDay} ${this.k.nowTime()}`
+    const target = this.inventory.targetOf(as0.targetType, as0.activityId, as0.targetId)
+    const cur = () => this.k.state.afterSales.find((x) => x.id === afterSaleId)
+
+    // —— 补发：库存不足则挂起 waiting_stock（不落账），采购入库后续办 ——
+    if (as0.type === 'reship' && target.row.remain <= 0 && !as0.stages?.reshipment) {
       const linkedPo = this.k.state.purchaseOrders.find((po) =>
-        (po.tenantId || 't-star') === as.tenantId && po.afterSaleId === as.id &&
+        (po.tenantId || 't-star') === as0.tenantId && po.afterSaleId === as0.id &&
         ['pending', 'approved', 'receiving'].includes(po.status))
       const reshipPrice = Math.round(Number(target.row.unitPrice) * 100) / 100 || 0
-      if (this.budget && reshipPrice > 0 && !linkedPo) {
+      if (this.budget && reshipPrice > 0 && !linkedPo && !as0.stages?.shortageReserve) {
         await this.budget.occupy('reserve',
-          { unit: 'money', amount: reshipPrice, scopeType: as.targetType === 'prize' ? 'activity' : 'tenant',
-            scopeId: as.targetType === 'prize' ? as.activityId : as.tenantId },
+          { unit: 'money', amount: reshipPrice, scopeType: as0.targetType === 'prize' ? 'activity' : 'tenant',
+            scopeId: as0.targetType === 'prize' ? as0.activityId : as0.tenantId },
           {
             category: 'reship', kind: 'reship-cost',
-            refType: 'aftersale', refId: as.id, bizNo: o.id,
-            summary: `缺货补发预占：【${as.targetName}】×1，估价 ${reshipPrice} 元（挂起待采购，结算时核销不重复付款）`,
-            tenantId: as.tenantId, userId: as.userId, traceId
+            refType: 'aftersale', refId: as0.id, bizNo: o.id,
+            summary: `缺货补发预占：【${as0.targetName}】×1，估价 ${reshipPrice} 元（挂起待采购，结算时核销不重复付款）`,
+            tenantId: as0.tenantId, userId: as0.userId, traceId
           }, ctx)
+        await this._setStage(cur(), 'shortageReserve')
       }
       const row = {
-        ...as,
-        status: 'waiting_stock',
-        reviewedAt: `${this.k.todayDate()} ${this.k.nowTime()}`,
-        reviewer: ctx.name, reviewNote: remark,
-        shortageNote: `审核通过但【${as.targetName}】库存不足（remain=0），挂起待采购补货后继续履约`
+        ...cur(),
+        status: 'waiting_stock', processing: false,
+        // 挂起审核时刻（申请→挂起）留痕；最终处理日在继续履约完成时由 reviewedAt 改写
+        suspendedAt: cur().suspendedAt || stamp,
+        reviewedAt: stamp, reviewer: ctx.name, reviewNote: remark,
+        shortageNote: `审核通过但【${as0.targetName}】库存不足（remain=0），挂起待采购补货后继续履约`
       }
       await this.k.commit([{ type: 'upsert', table: 'afterSales', row }])
-      await this.audit.log('aftersale-shortage', as.id,
-        `补发【${as.targetName}】库存不足，售后单转待补货（发货单 ${o.id}，账目与库存未变动）；请发起采购，验收入库后从待处理售后继续履约`,
-        { tenantId: as.tenantId, ctx, traceId })
-      return row
+      const o2 = this.requireShipment(as0.shipmentId)
+      await this.audit.log('aftersale-shortage', as0.id,
+        `补发【${as0.targetName}】库存不足，售后单转待补货（发货单 ${o2.id}，账目与库存未变动）；请发起采购，验收入库后从待处理售后继续履约`,
+        { tenantId: as0.tenantId, ctx, traceId, bizDate: procDay })
+      return
     }
 
-    if (as.type === 'reject' || as.type === 'return') {
-      await this.inventory.replenish(target, 1)
-      if (as.refundPoints > 0) {
-        await this.points.post({
-          userId: as.userId, delta: as.refundPoints,
-          note: `售后退款：${as.typeLabel}【${as.targetName}】（发货单 ${o.id}）`,
-          kind: 'refund', tenantId: as.tenantId, refId: as.id, refType: 'after-sale', traceId
+    if (as0.type === 'reject' || as0.type === 'return') {
+      // 1) 库存回补（effectId 幂等；跨日审核按审核日归属）
+      if (!cur().stages?.restock) {
+        await this.inventory.replenish(target, 1, {
+          effectId: `as-restock:${as0.id}`, bizDate: procDay, date: procDay,
+          refType: 'aftersale', refId: as0.id, tenantId: as0.tenantId, traceId
         })
-        // 营销预算：退货/拒收按申请时快照冲回已占用的积分成本（append-only，预算余额恢复）
-        if (this.budget) {
-          await this.budget.refund(
-            { unit: 'points', amount: as.refundPoints, scopeType: 'tenant', scopeId: as.tenantId },
-            {
-              category: o.bizType === 'draw' ? 'draw' : 'redeem',
-              kind: o.bizType === 'draw' ? 'draw-refund' : 'redeem-refund',
-              refType: 'aftersale', refId: as.id, bizNo: o.id,
-              summary: `售后退款冲回预算：${as.typeLabel}【${as.targetName}】+${as.refundPoints} 积分`,
-              tenantId: as.tenantId, userId: as.userId, traceId
-            }, ctx)
-        }
+        await this._setStage(cur(), 'restock')
+        this.k.maybeFault('aftersale.afterRestock')
       }
-      const shipRow = { ...o, status: 'returned', returnedAt: `${this.k.todayDate()} ${this.k.nowTime()}`, afterSaleId: as.id }
-      await this.k.commit([{ type: 'upsert', table: 'shipments', row: shipRow }])
-      await this.appendTrace(this.requireShipment(o.id), 'returned',
-        as.type === 'reject' ? '收件人拒收，包裹退回发货仓' : '退货包裹已退回发货仓，售后完成')
+      // 2) 积分退款（(kind,refId) 幂等；bizDate/date 双日落账，跨日审核归审核日不串申请日）
+      if (as0.refundPoints > 0 && !cur().stages?.refund) {
+        await this.points.post({
+          userId: as0.userId, delta: as0.refundPoints,
+          note: `售后退款：${as0.typeLabel}【${as0.targetName}】（发货单 ${o.id}）`,
+          kind: 'refund', tenantId: as0.tenantId,
+          bizDate: procDay, date: procDay,
+          refId: as0.id, refType: 'after-sale', traceId
+        })
+        await this._setStage(cur(), 'refund')
+        this.k.maybeFault('aftersale.afterRefund')
+      }
+      // 3) 预算冲回（按 effectId 幂等）
+      if (as0.refundPoints > 0 && this.budget && !cur().stages?.budget) {
+        await this.budget.refund(
+          { unit: 'points', amount: as0.refundPoints, scopeType: 'tenant', scopeId: as0.tenantId },
+          {
+            category: o.bizType === 'draw' ? 'draw' : 'redeem',
+            kind: o.bizType === 'draw' ? 'draw-refund' : 'redeem-refund',
+            refType: 'aftersale', refId: as0.id, bizNo: o.id,
+            summary: `售后退款冲回预算：${as0.typeLabel}【${as0.targetName}】+${as0.refundPoints} 积分`,
+            tenantId: as0.tenantId, userId: as0.userId, traceId
+          }, ctx)
+        await this._setStage(cur(), 'budget')
+      }
+      // 4) 发货单退回 + 轨迹（终态/轨迹节点均幂等）
+      if (!cur().stages?.shipReturn) {
+        const shipRow = { ...o, status: 'returned', returnedAt: o.returnedAt || stamp, afterSaleId: as0.id }
+        await this.k.commit([{ type: 'upsert', table: 'shipments', row: shipRow }])
+        if (!this.requireShipment(o.id).traces.some((t) => t.stage === 'returned')) {
+          await this.appendTrace(this.requireShipment(o.id), 'returned',
+            as0.type === 'reject' ? '收件人拒收，包裹退回发货仓' : '退货包裹已退回发货仓，售后完成')
+        }
+        await this._setStage(cur(), 'shipReturn')
+      }
     } else {
-      // 补发资金成本（按 SKU 采购成本口径 unitPrice 估算，0 表示未维护成本不占用）；
-      // 关联采购单已在途的（缺货挂起→采购入库）补发成本已在采购付款中结算，不重复占用
+      // —— 补发履约 ——
       const linkedPo = this.k.state.purchaseOrders.find((po) =>
-        (po.tenantId || 't-star') === as.tenantId && po.afterSaleId === as.id)
+        (po.tenantId || 't-star') === as0.tenantId && po.afterSaleId === as0.id)
       const reshipPrice = Math.round(Number(target.row.unitPrice) * 100) / 100 || 0
-      if (this.budget && reshipPrice > 0 && !(continuing && linkedPo)) {
+      if (this.budget && reshipPrice > 0 && linkedPo) {
+        // 缺货挂起时曾 reserve 的补发预占，入库继续履约时核销为实际成本（幂等）
+        if (!cur().stages?.budgetConvert) {
+          await this.budget.settleReserved('aftersale', as0.id, {
+            category: 'reship', kind: 'reship-cost', traceId,
+            summary: `缺货补发入库继续履约，核销补发预占：【${as0.targetName}】×1`
+          }, ctx)
+          await this._setStage(cur(), 'budgetConvert')
+        }
+      } else if (this.budget && reshipPrice > 0 && !cur().stages?.budget) {
+        // 即时补发（无在途采购）：补发资金成本直接 settle
         await this.budget.occupy('settle',
-          { unit: 'money', amount: reshipPrice, scopeType: as.targetType === 'prize' ? 'activity' : 'tenant',
-            scopeId: as.targetType === 'prize' ? as.activityId : as.tenantId },
+          { unit: 'money', amount: reshipPrice, scopeType: as0.targetType === 'prize' ? 'activity' : 'tenant',
+            scopeId: as0.targetType === 'prize' ? as0.activityId : as0.tenantId },
           {
             category: 'reship', kind: 'reship-cost',
-            refType: 'aftersale', refId: as.id, bizNo: o.id,
-            summary: `售后补发成本：【${as.targetName}】×1，估价 ${reshipPrice} 元`,
-            tenantId: as.tenantId, userId: as.userId, traceId
+            refType: 'aftersale', refId: as0.id, bizNo: o.id,
+            summary: `售后补发成本：【${as0.targetName}】×1，估价 ${reshipPrice} 元`,
+            tenantId: as0.tenantId, userId: as0.userId, traceId
           }, ctx)
+        await this._setStage(cur(), 'budget')
       }
-      await this.inventory.deduct(target, 1)
-      const reship = {
-        id: genId('sp'), recordId: o.recordId, bizType: o.bizType, status: 'to_ship',
-        tenantId: as.tenantId, traceId, userId: o.userId, userName: o.userName,
-        icon: o.icon, targetName: o.targetName, activityId: o.activityId,
-        source: '售后补发',
-        date: this.k.todayDate(), time: this.k.nowTime(), ts: this.k.nowTs(),
-        receiver: o.receiver, phone: o.phone, region: o.region, address: o.address, addressAt: o.addressAt,
-        shipper: '', carrier: '', trackingNo: '', shipNote: '', shippedAt: '', receivedAt: '',
-        traces: [], afterSaleId: as.id, returnedAt: '', originId: o.id
+      // 扣减库存（effectId 幂等；按实际处理日归属）
+      if (!cur().stages?.deduct) {
+        await this.inventory.deduct(target, 1, {
+          effectId: `as-reship:${as0.id}`, bizDate: procDay, date: procDay,
+          kind: 'aftersale-reship', refType: 'aftersale', refId: as0.id,
+          tenantId: as0.tenantId, traceId
+        })
+        await this._setStage(cur(), 'deduct')
+        this.k.maybeFault('aftersale.afterDeduct')
       }
-      await this.k.commit([{ type: 'insert', table: 'shipments', row: reship }])
-      const asRow = { ...as, reshipmentId: reship.id }
-      await this.k.commit([{ type: 'upsert', table: 'afterSales', row: asRow }])
-      await this.appendTrace(this.requireShipment(o.id), 'reship', `售后补发已受理，生成补发单 ${reship.id}，等待重新发货`)
-      await this.audit.log('ship-create', reship.id,
-        `售后补发【${o.targetName}】生成补发发货单（原单 ${o.id}，售后单 ${as.id}），沿用原收货信息，待运营重新发货`,
-        { tenantId: as.tenantId, ctx, traceId })
+      // 生成补发发货单（按售后单幂等，断点续办不重复生成）
+      if (!cur().stages?.reshipment) {
+        const reship = {
+          id: genId('sp'), recordId: o.recordId, bizType: o.bizType, status: 'to_ship',
+          tenantId: as0.tenantId, traceId, userId: o.userId, userName: o.userName,
+          icon: o.icon, targetName: o.targetName, activityId: o.activityId,
+          source: '售后补发',
+          date: procDay, time: this.k.nowTime(), ts: this.k.nowTs(),
+          receiver: o.receiver, phone: o.phone, region: o.region, address: o.address, addressAt: o.addressAt,
+          shipper: '', carrier: '', trackingNo: '', shipNote: '', shippedAt: '', receivedAt: '',
+          traces: [], afterSaleId: as0.id, returnedAt: '', originId: o.id
+        }
+        await this.k.commit([{ type: 'insert', table: 'shipments', row: reship }])
+        await this.k.commit([{ type: 'upsert', table: 'afterSales', row: { ...cur(), reshipmentId: reship.id } }])
+        if (!this.requireShipment(o.id).traces.some((t) => t.stage === 'reship')) {
+          await this.appendTrace(this.requireShipment(o.id), 'reship', `售后补发已受理，生成补发单 ${reship.id}，等待重新发货`)
+        }
+        await this.audit.log('ship-create', reship.id,
+          `售后补发【${as0.targetName}】生成补发发货单（原单 ${o.id}，售后单 ${as0.id}），沿用原收货信息，待运营重新发货`,
+          { tenantId: as0.tenantId, ctx, traceId, bizDate: procDay })
+        await this._setStage(cur(), 'reshipment')
+      }
     }
 
-    const doneRow = {
-      ...this.k.state.afterSales.find((x) => x.id === as.id),
-      status: 'done', reviewedAt: `${this.k.todayDate()} ${this.k.nowTime()}`, reviewer: ctx.name, reviewNote: remark
+    // —— 售后单终态（各 stage 全部落完才置 done + 清锚点）——
+    // reviewedAt 一律改写为本次完成时刻：缺货挂起时记录的是挂起时刻，继续履约（可能跨日）
+    // 完成后必须以实际处理日为准，保证库存/退款/审计按处理日分账。
+    const final0 = cur()
+    if (final0.status !== 'done' || final0.processing || final0.reviewedAt !== stamp) {
+      await this.k.commit([{
+        type: 'upsert', table: 'afterSales',
+        row: {
+          ...final0, status: 'done', processing: false,
+          reviewedAt: stamp, reviewer: final0.reviewer || ctx.name, reviewNote: remark
+        }
+      }])
     }
-    await this.k.commit([{ type: 'upsert', table: 'afterSales', row: doneRow }])
-    await this.audit.log('aftersale-approve', as.id,
-      as.type === 'reship'
-        ? `${continuing ? '采购入库后继续履约：' : ''}同意补发【${as.targetName}】：库存扣减 1，生成补发单 ${doneRow.reshipmentId}${remark ? '；备注：' + remark : ''}`
-        : `同意${as.typeLabel}【${as.targetName}】：库存回补 1${as.refundPoints ? `、返还 ${as.refundPoints} 积分` : ''}，发货单 ${o.id} 已退回${remark ? '；备注：' + remark : ''}`,
-      { tenantId: as.tenantId, ctx, traceId })
-    return doneRow
+    const done = cur()
+    if (!done.stages?.audit) {
+      const crossDay = as0.createdAt !== procDay
+      await this.audit.log('aftersale-approve', as0.id,
+        as0.type === 'reship'
+          ? `${crossDay ? '跨日续办：' : ''}同意补发【${as0.targetName}】：库存扣减 1，生成补发单 ${done.reshipmentId}（归属业务日 ${procDay}）${remark ? '；备注：' + remark : ''}`
+          : `同意${as0.typeLabel}【${as0.targetName}】：库存回补 1${as0.refundPoints ? `、返还 ${as0.refundPoints} 积分` : ''}，发货单 ${o.id} 已退回（归属业务日 ${procDay}）${remark ? '；备注：' + remark : ''}`,
+        { tenantId: as0.tenantId, ctx, traceId, bizDate: procDay })
+      await this._setStage(cur(), 'audit')
+    }
+  }
+
+  // 启动/手工续办：把 processing 中的售后单执行到终态（与交易/风控续办同一套机制）
+  async resumeProcessing() {
+    const resumed = []
+    for (const as of [...this.k.state.afterSales]) {
+      if (!as.processing) continue
+      await this.withAfterSaleLock(as.id, async () => {
+        await this._completeAfterSale(as.id, as.reviewNote || '故障续办', { name: as.reviewer || '系统' })
+      })
+      resumed.push(as.id)
+    }
+    return resumed
   }
 }

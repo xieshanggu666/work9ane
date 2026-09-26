@@ -210,7 +210,10 @@ export class RiskService {
       )
       if (this.k.findStock(stockKey)) {
         await this.k.commit([
-          { type: 'inv.mut', key: stockKey, dRemain: 0, dFrozen: -o0.stockHeld, effectId: `release-consume:${o0.id}` }
+          { type: 'inv.mut', key: stockKey, dRemain: 0, dFrozen: -o0.stockHeld, effectId: `release-consume:${o0.id}`,
+            // 核销预占的库存消耗归属冻结时的业务日（跨日放行不串处理日库存账），实际核销日另记 date
+            kind: 'consume-held', bizDate: o0.createdAt, date: this.k.todayDate(),
+            refType: 'risk-order', refId: o0.id, tenantId: tid, traceId }
         ])
       }
       await this._setStage(this.k.state.riskOrders.find((x) => x.id === orderId), 'consume')
@@ -269,7 +272,8 @@ export class RiskService {
     if (!this.k.state.riskOrders.find((x) => x.id === orderId).stages.audit) {
       await this.audit.log('release', orderId,
         `放行${o0.bizType === 'draw' ? '抽奖' : '兑换'}【${o0.targetName}】${note ? '；备注：' + note : ''}`,
-        { tenantId: tid, ctx, traceId })
+        // 放行核销/发奖/任务补计归属冻结时业务日，审核动作发生在实际处理日
+        { tenantId: tid, ctx, traceId, bizDate: o0.createdAt })
       await this._setStage(this.k.state.riskOrders.find((x) => x.id === orderId), 'audit')
     }
   }
@@ -308,7 +312,10 @@ export class RiskService {
       )
       if (this.k.findStock(stockKey)) {
         await this.k.commit([
-          { type: 'inv.mut', key: stockKey, dRemain: o0.stockHeld, dFrozen: -o0.stockHeld, effectId: `revoke-restock:${o0.id}` }
+          { type: 'inv.mut', key: stockKey, dRemain: o0.stockHeld, dFrozen: -o0.stockHeld, effectId: `revoke-restock:${o0.id}`,
+            // 撤销回补按实际审核日入账（库存重新可售，计入处理日业务日）
+            kind: 'revoke-restock', bizDate: this.k.todayDate(), date: this.k.todayDate(),
+            refType: 'risk-order', refId: o0.id, tenantId: tid, traceId }
         ])
       }
       await this._setStage(this.k.state.riskOrders.find((x) => x.id === orderId), 'restock')
@@ -333,7 +340,7 @@ export class RiskService {
     if (!this.k.state.riskOrders.find((x) => x.id === orderId).stages.audit) {
       await this.audit.log('revoke', orderId,
         `撤销${o0.bizType === 'draw' ? '抽奖' : '兑换'}【${o0.targetName}】，返还${o0.frozenPoints}积分${o0.stockHeld ? `、回补库存×${o0.stockHeld}` : ''}${rec.couponId ? '、释放预占券（未发放）' : ''}${o0.bizType === 'draw' ? '；该笔不计入抽奖任务进度（冻结期间暂缓，撤销后确认回退）' : ''}${note ? '；备注：' + note : ''}`,
-        { tenantId: tid, ctx, traceId })
+        { tenantId: tid, ctx, traceId, bizDate: this.k.todayDate() })
       await this._setStage(this.k.state.riskOrders.find((x) => x.id === orderId), 'audit')
     }
   }

@@ -198,8 +198,12 @@ export class PurchaseService {
     const traceId = this.k.newTraceId()
     const batchId = genId('pb')
     const before = t.row.remain
-    // 幂等：同一批次 id 的库存抬升只生效一次（崩溃重放/重复提交安全）
-    await this.inventory.receive(target, qty, `po-inbound:${batchId}`)
+    // 幂等：同一批次 id 的库存抬升只生效一次（崩溃重放/重复提交安全）；
+    // 入库按验收日归属业务日，台账行带批次/采购单勾稽
+    await this.inventory.receive(target, qty, `po-inbound:${batchId}`, {
+      bizDate: this.k.todayDate(), date: this.k.todayDate(),
+      refType: 'po-batch', refId: batchId, tenantId: po0.tenantId, traceId
+    })
     const after = this.k.state.purchaseOrders.find((x) => x.id === po0.id)
     const filled = after.inboundQty + qty >= po0.qty
     const status = filled ? 'received' : (closeShortage ? 'diff_closed' : 'receiving')

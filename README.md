@@ -68,6 +68,7 @@ npm run dev
 ```bash
 npm run server            # node server/index.js --port 8080 --db data/server-wal.jsonl
 npm run test:server       # 服务内核：并发不超卖 / 幂等 / 崩溃续办 / 跨日审核 / P1–P6 对账补偿 / RBAC / 采购入库 / 供应商结算闭环
+npm run test:crossday     # 统一跨日续办：风控放行/撤销、任务结算、售后补发（含缺货挂起跨日续办）双日分账与崩溃续办
 npm run test:migration    # 历史台账迁移：校验 → 迁移 → 对账补偿 → 重跑幂等
 npm run test:http         # HTTP E2E：真实起服，token 鉴权 / REST / 采购+供应商结算 API / 故障注入重启续办
 ```
@@ -79,7 +80,7 @@ server/
 ├── index.js               # 入口（node:http）
 ├── http.js                # REST API：Bearer token、RBAC 权限位、租户归属强校验
 ├── app.js                 # 服务装配：内核 + 领域服务 + 空库种子 + 启动续办
-├── kernel.js              # 事件溯源内核：JSONL WAL + 状态投影 + effectId 幂等 + 时钟/故障注入
+├── kernel.js              # 事件溯源内核：JSONL WAL + 状态投影 + effectId 幂等 + 时钟/故障注入；append-only 库存台账（双日分账底账）
 ├── util.js                # KeyedLock 按键互斥、Journal 落盘、业务时钟
 ├── seed.js / mock-*.js    # 多租户原生种子（活动/商品/卡券/组织/多用户积分分户）
 ├── legacy-snapshot.js     # 旧 Pinia store 台账快照提取（仅迁移/打包测试使用）
@@ -90,12 +91,12 @@ server/
     ├── trade.js           # 交易 Saga 编排：风控→扣分预占→库存→记录→发奖→任务结算；processing 续办
     ├── risk.js            # 风控评估/审核单状态机；放行/撤销本身也是幂等可续办 Saga
     ├── coupon.js          # 券码唯一、hold/deliver/revoke/redeem/expire 全台账
-    ├── ship.js            # 发货状态机 + 售后拒收/退货/补发（缺货挂起 waiting_stock，入库后继续履约；异常整体回退）
+    ├── ship.js            # 发货状态机 + 售后拒收/退货/补发 Saga（processing/stages 幂等续办；缺货挂起 waiting_stock，跨日按审核日双日入账，入库后继续履约；异常整体回退）
     ├── purchase.js        # 采购单：发起→审批→分批验收入库（到货/合格/验退/短少差异，差异结案）
     ├── supplier.js        # 供应商账单：拟单→财务复核→结算，按批次×售后补发回写库存对账快照
     ├── budget.js          # 营销预算：租户/活动两级×积分/资金双币种，审批流 + reserve/settle/release/refund 实时占用台账
     ├── task.js            # 任务按 用户×租户×业务日 自动结算（多用户隔离、跨日补计）
-    ├── recon.js           # P1–P6 六口径对账、签名幂等差异单、只追加补偿
+    ├── recon.js           # P1–P6 六口径对账、签名幂等差异单、只追加补偿；P5 按业务日/实际处理日双口径分账（库存台账重放）
     ├── audit.js           # append-only 审计 + traceId 全链路时间线
     └── migration.js       # 历史台账迁移：校验/固定 id/effectId/批次 manifest 与校验和
 ```
@@ -104,6 +105,11 @@ server/
 - **多用户并发**：`points:<userId>`、`goods:<id>`、`act:<activityId>` 按键互斥（多键有序加锁防死锁），库存余量在锁内二次确认；10 并发抢 3 件恰好成交 3 笔，余额/库存/流水精确一致。
 - **故障续办**：交易与审核单带 `processing` 锚点 + 分阶段 `stages`；注入 `draw.afterCost / release.afterConsume / revoke.afterRefund` 等崩溃点后，进程重启重放 WAL 并自动把中断的 Saga 续办到终态（`POST /api/admin/resume` 可手工触发）。
 - **跨日审核**：可写虚拟业务时钟（`POST /api/admin/day`）；冻结权益跨日保留，放行后积分奖品/任务奖励流水 `bizDate=原参与日`、`date=实际处理日`，对账不串当日。
+- **统一跨日续办与双日分账**：风控放行/撤销、任务自动结算、售后补发（含缺货挂起→采购入库→继续履约）三类动作**共用同一套 Saga 模型**——先落 `processing` 锚点、再按 `stages` 分阶段幂等执行，积分流水以 `(kind,refId)`、库存变动以 `effectId` 去重；崩溃重启或 `POST /api/admin/resume` 统一扫描交易/风控单/售后单续办到终态，绝不重复扣分、重复扣库存、重复发奖或重复生成补发单。所有跨日动作**按「归属业务日 `bizDate` / 实际处理日 `date`」双日分账**：
+  - 风控放行：库存核销/积分发奖/任务补计归属冻结业务日；撤销返还、售后退回/补发按**实际审核处理日**入账（申请日只留痕）；
+  - 任务领奖台账 `bizDate=达标业务日`、`grantDate=实际发放日`，流水 `bizDate/date` 双日落；
+  - 库存一切变动写入 **append-only 库存台账 `stockLedger`**（期初 `opening` + 预占/核销/回补/采购入库/售后补发退回/对账调整），每行带 `bizDate/date/effectId/refType/refId/traceId`，是 **P5 按业务日分账**的底账：「应有 remain」按事件归属日重建（期初+采购入库−有效消耗+调整凭证），「实际 remain」按实际处理日重放——跨日续办只改处理日当日账，**历史业务日差异单签名不漂移、不串账**；历史台账迁移会重建同一套库存台账（SKU 从 0 起、opening + 逐笔事实重放）；
+  - 审计日志统一带 `bizDate`（归属业务日）与 `date`（处理日），一次动作的积分/库存/预算/审计共享 `traceId`，可按双日勾稽；P1 积分、P5 库存、预算台账、卡券台账四类口径跨日均平。
 - **历史台账迁移**：迁移前校验余额链/库存账实/冻结单/券码唯一，不通过整批拒绝；通过后以**固定行 id + 固定 effectId** 重建事件库（中断重跑零增量），旧种子日期按 ts 反推业务日、补期初结转行与冗余成本字段；manifest 记 sha256 校验和；迁移后历史漏记直接由 P1/P2 检出并走同一套补偿链路。
 - **租户鉴权/对账/审计贯通**：登录换 token，写接口强制 RBAC + tenantId 归属，越权/停用登录写 `result=denied` 审计；一租户一业务日一张差异单；一次操作的积分流水、卡券台账、审计共享 `traceId`。
 
@@ -202,7 +208,7 @@ lottery-platform/
 - 采购入库冒烟：`npm run test:purchase`（三权分立 RBAC、发起/驳回/撤销状态机、分批验收超量拦截与幂等、缺货挂起→采购→继续履约、P5 勾稽、租户隔离、审计留痕）。
 - 供应商结算冒烟：`npm run test:supplier`（验退/短少差异结案、运营拟单→财务驳回重提→复核→结算、实收合格计价、售后补发占用不重复付款、批次回写快照、P7 独立闭环不污染 P1–P6、租户隔离、审计留痕、WAL 恢复）。
 - 预算闭环冒烟：`npm run test:budget`（前端：预算编制/审批 RBAC、抽奖/采购超额整笔阻断、风控冻结预占→放行核销/撤销释放、采购预占→驳回释放→付款核销、预算冻结阻断、调整审批、任务奖励占用、租户隔离）；`npm run test:budget-server`（服务端：锁内并发不超预算、WAL 台账重放恢复、占用 effectId 幂等、售后退款冲回）；HTTP API 覆盖见 `test:http` 的「营销预算 API」段。
-- 服务端链路测试：`npm run test:server`（内核协作链路，含采购入库 + 缺货补发继续履约 + 重启幂等）、`npm run test:migration`（历史台账迁移）、`npm run test:http`（HTTP 端到端，含采购/供应商结算/预算 REST API 与权限位），共 12 套冒烟全部通过。
+- 服务端链路测试：`npm run test:server`（内核协作链路，含采购入库 + 缺货补发继续履约 + 重启幂等）、`npm run test:crossday`（统一跨日续办/双日分账/售后 Saga 崩溃续办）、`npm run test:migration`（历史台账迁移）、`npm run test:http`（HTTP 端到端，含采购/供应商结算/预算 REST API 与权限位），共 13 套冒烟全部通过。
 
 ## 抽奖任务自动结算说明
 

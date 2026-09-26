@@ -54,7 +54,7 @@ export class TaskService {
         ctx)
     }
     await this.audit.log('task-settle', claimId, `完成手动任务【${t.label}】，发放 ${t.reward} 积分`,
-      { tenantId, ctx })
+      { tenantId, ctx, bizDate: date })
     return { claim, idempotent: false }
   }
 
@@ -129,7 +129,8 @@ export class TaskService {
       }
       await this.audit.log('task-settle', '',
         `【${this.k.state.tenants.find((x) => x.id === tenantId)?.shortName || tenantId}】用户【${userId}】抽奖任务【${t.label}】达成（${date} 有效参与 ${valid}/${t.goal}），自动发放 ${t.reward} 积分${crossDay ? '（跨日审核补计）' : ''}`,
-        { tenantId, traceId })
+        // 任务奖励按归属业务日分账，实际发放日（grantDate）由台账/流水 date 另记
+        { tenantId, traceId, bizDate: date })
       settled.push(claim)
     }
     return settled

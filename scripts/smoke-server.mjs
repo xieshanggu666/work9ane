@@ -432,9 +432,18 @@ async function testPurchase() {
   assert(dup instanceof BizError && dup.code === 'STATE_DENIED', '完结后重复验收被状态机拦截')
   assert(app.k.state.inboundBatches.filter((b) => b.poId === po.id).length === 2, '两批验收写入 append-only 台账')
 
-  // 缺货补发：把 g3 账面调到「仅剩 1 件」（stock 与已消耗保持勾稽，不制造盘亏）→ 兑完 → 补发缺货
-  const consumedG3 = app.k.state.records.filter((r) => r.type === 'redeem' && r.goodsId === 'g3' && r.status !== 'revoked').length
-  await app.k.commit([{ type: 'upsert', table: 'goods', row: { ...g3, remain: 1, stock: consumedG3 + 1 } }])
+  // 缺货补发：把 g3 可用余量压到 1（只动 remain 的盘点式修正，走台账留痕；物理总量 stock 不变）→ 兑完 → 补发缺货
+  {
+    const g3row = app.k.findStock('goods:g3')
+    const shrink = g3row.row.remain - 1
+    if (shrink > 0) {
+      await app.k.commit([{ type: 'inv.mut', key: 'goods:g3', dRemain: -shrink, dFrozen: 0,
+        effectId: 'test-fixture:shrink-g3', kind: 'fixture-adjust', refType: 'test', refId: 'shrink-g3',
+        tenantId: 't-star' }])
+    }
+    const g3fixed = app.k.state.goods.find((g) => g.id === 'g3')
+    assert(g3fixed.remain === 1, '夹具：g3 可用余量压至仅剩 1 件（库存台账留痕，物理总量不变）')
+  }
   const customer = customerCtx(app)
   const r = await app.trade.redeem('g3', customer, { idempotencyKey: 'po-reship-1' })
   const sp = await app.ship.createForRecord(app.k.state.records.find((x) => x.id === r.trade.id))
@@ -457,7 +466,10 @@ async function testPurchase() {
   const cont = await app.ship.reviewAfterSale(asRow.id, true, '到货继续履约', shipStaff)
   assert(cont.status === 'done' && !!cont.reshipmentId, '继续履约：售后单完成并生成补发单')
   const g3Done = app.k.state.goods.find((g) => g.id === 'g3')
-  assert(g3Done.remain === 9 && g3Done.stock === 11, '入库 +10 后补发扣 1：remain=9、stock=11')
+  // 物理总量 = 初始 + 两笔采购（50+10），夹具只压可用余量不改总量；补发只再扣 remain
+  const expectStock = totalBefore + 60
+  assert(g3Done.remain === 9 && g3Done.stock === expectStock,
+    `入库 +10 后补发扣 1：remain=9、stock=${expectStock}（实际 remain=${g3Done.remain}/stock=${g3Done.stock}）`)
   // P5 对账仍平
   const diffs = app.recon.compute(app.k.todayDate(), 't-star')
   assert(diffs.stock.filter((x) => x.diff !== 0).length === 0,

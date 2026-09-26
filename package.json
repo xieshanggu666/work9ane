@@ -17,6 +17,7 @@
     "test:coupon": "esbuild scripts/smoke-coupon.mjs --bundle --format=esm --platform=node --alias:@=./src --outfile=node_modules/.cache/smoke-coupon.bundle.mjs --log-level=warning && node node_modules/.cache/smoke-coupon.bundle.mjs",
     "test:tenant": "esbuild scripts/smoke-tenant.mjs --bundle --format=esm --platform=node --alias:@=./src --outfile=node_modules/.cache/smoke-tenant.bundle.mjs --log-level=warning && node node_modules/.cache/smoke-tenant.bundle.mjs",
     "test:server": "node scripts/smoke-server.mjs",
+    "test:crossday": "node scripts/smoke-crossday.mjs",
     "test:budget-server": "node scripts/smoke-budget-server.mjs",
     "test:migration": "esbuild scripts/smoke-migration.mjs --bundle --format=esm --platform=node --alias:@=./src --outfile=node_modules/.cache/smoke-migration.bundle.mjs --log-level=warning && node node_modules/.cache/smoke-migration.bundle.mjs",
     "test:http": "node scripts/smoke-http.mjs",

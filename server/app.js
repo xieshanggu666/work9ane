@@ -30,7 +30,7 @@ export async function createApp(options = {}) {
   const inventory = new InventoryService(k)
   const coupons = new CouponService(k, audit)
   const budget = new BudgetService({ k, audit, locks })
-  const ship = new ShipService(k, audit, points, inventory, budget)
+  const ship = new ShipService(k, audit, points, inventory, budget, locks)
   const purchase = new PurchaseService(k, audit, inventory, locks, budget)
   const supplier = new SupplierService({ k, audit, locks, budget })
   const tasks = new TaskService(k, audit, points, budget)
@@ -46,19 +46,22 @@ export async function createApp(options = {}) {
   const fresh = k.state.tenants.length === 0 && k.state.activities.length === 0
   if (fresh && options.seed !== false) {
     await seedFresh(k)
+    // 期初库存建账：每个 SKU 当前账面总量登记 opening 行（幂等），作为 P5 按业务日分账底账
+    await k.ensureStockOpening()
   } else if (fresh && options.seed === false && options.bootstrapPlatform !== false) {
     // 空库迁移模式（--no-seed）：仅引导平台骨架（超管账号），业务台账等待离线快照迁移上云
     await seedPlatformSkeleton(k)
   }
 
-  // 启动续办：崩溃后重放 WAL，把 processing 的交易/审核单执行到终态（幂等无重复副作用）。
+  // 启动续办：崩溃后重放 WAL，把 processing 的交易/审核单/售后单执行到终态（幂等无重复副作用）。
   // 可通过 options.autoResume=false 关闭（测试需先还原虚拟业务日再手工续办时使用）。
   if (options.autoResume !== false) {
     const resumedTrades = await trade.resumeAll({ name: '系统启动续办' })
     const resumedOrders = await risk.resumeProcessing()
-    if (resumedTrades.length || resumedOrders.length) {
+    const resumedAfterSales = await ship.resumeProcessing()
+    if (resumedTrades.length || resumedOrders.length || resumedAfterSales.length) {
       await audit.log('saga-resume', '',
-        `启动续办完成：交易 ${resumedTrades.length} 笔、风控审核 ${resumedOrders.length} 笔已从断点续办到终态`,
+        `启动续办完成：交易 ${resumedTrades.length} 笔、风控审核 ${resumedOrders.length} 笔、售后审核 ${resumedAfterSales.length} 笔已从断点续办到终态`,
         { tenantId: '' })
     }
   }

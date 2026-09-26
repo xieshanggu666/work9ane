@@ -176,7 +176,9 @@ export class TradeService {
     if (prize.rarity !== 'none' && !rec.stages.stock) {
       const target = this.inventory.targetOf('prize', act.id, prize.id)
       await this.k.commit([
-        { type: 'inv.mut', key: target.key, dRemain: -1, dFrozen: 0, effectId: `draw-stock:${rec.id}` }
+        { type: 'inv.mut', key: target.key, dRemain: -1, dFrozen: 0, effectId: `draw-stock:${rec.id}`,
+          kind: 'draw-deduct', bizDate: rec.date, refType: 'record', refId: rec.id,
+          tenantId: act.tenantId, traceId: rec.traceId }
       ])
       await this._stage(this.k.state.records.find((r) => r.id === rec.id), 'stock')
     }
@@ -240,7 +242,9 @@ export class TradeService {
     if (prize.rarity !== 'none' && !rec.stages.stock) {
       const target = this.inventory.targetOf('prize', act.id, prize.id)
       await this.k.commit([
-        { type: 'inv.mut', key: target.key, dRemain: -1, dFrozen: 1, effectId: `freeze-stock:${rec.id}` }
+        { type: 'inv.mut', key: target.key, dRemain: -1, dFrozen: 1, effectId: `freeze-stock:${rec.id}`,
+          kind: 'hold', bizDate: rec.date, refType: 'risk-order', refId: rec.riskOrderId || rec.id,
+          tenantId: act.tenantId, traceId: rec.traceId }
       ])
       await this._stage(this.k.state.records.find((r) => r.id === rec.id), 'stock')
     }
@@ -322,7 +326,9 @@ export class TradeService {
     if (!rec.stages.stock) {
       const target = this.inventory.targetOf('goods', null, g.id)
       await this.k.commit([
-        { type: 'inv.mut', key: target.key, dRemain: -1, dFrozen: 0, effectId: `redeem-stock:${rec.id}` }
+        { type: 'inv.mut', key: target.key, dRemain: -1, dFrozen: 0, effectId: `redeem-stock:${rec.id}`,
+          kind: 'redeem-deduct', bizDate: rec.date, refType: 'record', refId: rec.id,
+          tenantId: g.tenantId, traceId: rec.traceId }
       ])
       await this._stage(this.k.state.records.find((r) => r.id === rec.id), 'stock')
     }
@@ -360,7 +366,9 @@ export class TradeService {
     if (!rec.stages.stock) {
       const target = this.inventory.targetOf('goods', null, g.id)
       await this.k.commit([
-        { type: 'inv.mut', key: target.key, dRemain: -1, dFrozen: 1, effectId: `freeze-stock:${rec.id}` }
+        { type: 'inv.mut', key: target.key, dRemain: -1, dFrozen: 1, effectId: `freeze-stock:${rec.id}`,
+          kind: 'hold', bizDate: rec.date, refType: 'risk-order', refId: rec.riskOrderId || rec.id,
+          tenantId: g.tenantId, traceId: rec.traceId }
       ])
       await this._stage(this.k.state.records.find((r) => r.id === rec.id), 'stock')
     }
@@ -424,7 +432,9 @@ export class TradeService {
         if (prize.rarity !== 'none') {
           const target = this.inventory.targetOf('prize', act.id, prize.id)
           await this.k.commit([
-            { type: 'inv.mut', key: target.key, dRemain: -1, dFrozen: 1, effectId: `freeze-stock:${rec.id}` }
+            { type: 'inv.mut', key: target.key, dRemain: -1, dFrozen: 1, effectId: `freeze-stock:${rec.id}`,
+              kind: 'hold', bizDate: rec.date, refType: 'risk-order', refId: rec.riskOrderId || rec.id,
+              tenantId: rec.tenantId, traceId }
           ])
         }
         let order = this.k.state.riskOrders.find((o) => o.recordId === rec.id)
@@ -460,7 +470,9 @@ export class TradeService {
         await this._budgetOccupy('reserve', live.budgetItems || this._redeemBudgetItems(g), live, ctx)
         const target = this.inventory.targetOf('goods', null, g.id)
         await this.k.commit([
-          { type: 'inv.mut', key: target.key, dRemain: -1, dFrozen: 1, effectId: `freeze-stock:${rec.id}` }
+          { type: 'inv.mut', key: target.key, dRemain: -1, dFrozen: 1, effectId: `freeze-stock:${rec.id}`,
+            kind: 'hold', bizDate: rec.date, refType: 'risk-order', refId: rec.riskOrderId || rec.id,
+            tenantId: g.tenantId, traceId }
         ])
         let order = this.k.state.riskOrders.find((o) => o.recordId === rec.id)
         if (!order) {

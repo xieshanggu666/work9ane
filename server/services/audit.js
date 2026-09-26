@@ -69,6 +69,9 @@ export class AuditService {
       result: extra.result || 'success',
       detail,
       date: extra.date || this.k.todayDate(),
+      // 归属业务日：跨日续办（风控放行/撤销、售后补发/退回）由调用方显式传入原业务日，
+      // 缺省与实际处理日一致；审计时间线/检索可按双日勾稽。
+      bizDate: extra.bizDate || extra.date || this.k.todayDate(),
       time: this.k.nowTime(),
       logTs: this.k.nowTs()
     }
